@@ -572,7 +572,7 @@ def safe_train_regression(dataset, layer, seed, model_cfg, train_cfg, Ad, Bd, un
 # 3. SWEEP DEFINITIONS & RAY WORKER
 # =========================================================================
 def get_sweep_configs():
-    hp = {"d_model": 128, "n_layers": 2, "dropout": 0.0, "prenorm": True, "lr": 1e-3, "batch_size": 32, "epochs": 100, "N": 64, "l_max": 100}
+    hp = {"d_model": 128, "n_layers": 2, "dropout": 0.0, "prenorm": True, "lr": 1e-3, "batch_size": 32, "epochs": 3, "N": 64, "l_max": 100}
     hp_marginal = hp.copy()
     hp_marginal["d_model"] = 64
     Z = np.zeros((2, 2))
