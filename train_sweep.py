@@ -688,10 +688,14 @@ def train_single_model(matrix_dict, hp_dict):
     
     wandb.log({"final_test_mse": final_mse})
 
-    # --- NEW: Run Evaluation INSIDE the worker before W&B closes ---
+    # --- CRITICAL FIX: Load the RNN (decode=True) version of the model ---
+    rnn_model = load_model_regression(unique_save_path, d_input_arg=9, d_output_arg=6)
+    # ---------------------------------------------------------------------
+
+    # --- Run Evaluation INSIDE the worker before W&B closes ---
     plot_title = f"Matrix {matrix_id} | d_model={model_cfg['d_model']} | Test MSE: {final_mse:.6f}"
     run_evaluation(
-        model=trained_model, 
+        model=rnn_model,  # <--- Pass the RNN model here!
         Ad=Ad, 
         Bd=Bd, 
         d_model=model_cfg['d_model'], 
@@ -699,12 +703,12 @@ def train_single_model(matrix_dict, hp_dict):
         dataset_name="microgrid", 
         custom_title=plot_title
     )
-    # ---------------------------------------------------------------
 
     # 3. Close the run
     wandb.finish()
     
     return {"matrix_id": matrix_id, "mse": final_mse, "path": unique_save_path}
+
 
 # =========================================================================
 # 4. HEADLESS PLOTTING & EVALUATION
@@ -825,15 +829,15 @@ if __name__ == "__main__":
     df.to_csv(csv_path, index=False)
     print(f"\n✅ Sweep Complete! Results saved to {csv_path}")
     
-    # 4. Immediately Evaluate Top Models
-    top_models = df.sort_values(by="mse", ascending=True).head(7)
-    print("\n🏆 Top Models from the Sweep:")
-    print(top_models[['matrix_id', 'mse', 'path']])
+    # # 4. Immediately Evaluate Top Models
+    # top_models = df.sort_values(by="mse", ascending=True).head(7)
+    # print("\n🏆 Top Models from the Sweep:")
+    # print(top_models[['matrix_id', 'mse', 'path']])
 
-    matrix_lookup = {exp[0]["matrix_id"]: exp[0]["A_continuous"] for exp in experiments}
-    meta = DatasetMetadata.get("microgrid", {})
-    d_in = len(meta.get("input_labels", [1]))
-    d_out = len(meta.get("output_labels", [1]))
+    # matrix_lookup = {exp[0]["matrix_id"]: exp[0]["A_continuous"] for exp in experiments}
+    # meta = DatasetMetadata.get("microgrid", {})
+    # d_in = len(meta.get("input_labels", [1]))
+    # d_out = len(meta.get("output_labels", [1]))
 
     # for index, row in top_models.iterrows():
     #     mat_id = int(row['matrix_id'])
