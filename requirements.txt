@@ -1,1 +1,9 @@
-# No external dependencies are required for train_sweep.py.
+flax
+optax
+ray
+pandas
+numpy
+matplotlib
+tqdm
+# TACC requires the specific CUDA 12 JAX build
+jax[cuda12]
