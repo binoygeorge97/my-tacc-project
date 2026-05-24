@@ -578,7 +578,39 @@ def get_sweep_configs():
     # Matrix 1
     A1 = np.block([[np.array([[-3.5, -2.4], [0.0, 0.0]]), np.array([[0.0, 0.03], [0.0, 0.0]]), np.array([[0.0, 0.06], [0.0, 0.0]])],
                    [Z, np.array([[-3.5, -2.3], [0.0, 0.0]]), Z], [Z, Z, np.array([[-5.2, -5.3], [0.0, 0.0]])]])
-    configs.append([{"matrix_id": 1, "A_continuous": A1}, hp_marginal])
+    configs.append([{"matrix_id": "1", "A_continuous": A1}, hp_marginal])
+
+
+    # Matrix 1A
+    A4_1a = np.array([[-2.5, -2.0],
+               [ 0.0,  0.0]])
+    A5_1a = np.array([[-3.0, -1.5],
+                   [ 0.0,  0.0]])
+    A6_1a = np.array([[-4.0, -2.2],
+                   [ 0.0,  0.0]])
+    A1a = np.block([
+        [A4_1a, Z, Z],
+        [Z, A5_1a, Z],
+        [Z, Z, A6_1a]
+    ])
+    configs.append([{"matrix_id": "1a", "A_continuous": A1a}, hp_marginal])
+
+
+    # Matrix 1B
+    A4_1b = np.array([[-1.8, -3.0],
+               [ 0.0,  0.0]])
+    A5_1b = np.array([[-2.2, -2.8],
+                   [ 0.0,  0.0]])
+    A6_1b = np.array([[-3.5, -4.1],
+                   [ 0.0,  0.0]])
+    A1b = np.block([
+        [A4_1b, Z, Z],
+        [Z, A5_1b, Z],
+        [Z, Z, A6_1b]
+    ])
+    configs.append([{"matrix_id": "1b", "A_continuous": A1b}, hp_marginal])
+
+    
     # Matrix 2
     A2 = np.block([[np.array([[1.0, 0.5], [0.0, 2.0]]), Z, Z], [Z, np.array([[1.5, 0.5], [0.0, 3.0]]), Z], [Z, Z, np.array([[0.5, 0.5], [0.0, 4.0]])]])
     configs.append([{"matrix_id": 2, "A_continuous": A2}, hp])
