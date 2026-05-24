@@ -1,3 +1,4 @@
+
 #!/bin/bash
 #SBATCH -J nnx_sweep
 #SBATCH -o nnx_sweep_%j.out
@@ -5,24 +6,28 @@
 #SBATCH -p gpu-a100                 # Change to gpu-h100 if you want the H100 nodes
 #SBATCH -N 3                        # Requesting 3 nodes
 #SBATCH -n 3                        # 3 tasks (1 per node)
-#SBATCH -t 01:00:00                 # Max runtime (2 hours)
-#SBATCH -A IRI26016        # <--- REPLACE WITH YOUR TACC PROJECT CODE
+#SBATCH -t 02:00:00                 # Max runtime (2 hours)
+#SBATCH -A IRI26016 
 #SBATCH --mail-user=phdstudiescontrols@gmail.com
 #SBATCH --mail-type=BEGIN,END,FAIL
 
-# 1. Load Core TACC Modules (No system python!)
+# 1. Load Core TACC Modules (Purge first to prevent conflicts)
 module purge
 module load TACC
-module load cuda/12.0
+# NOTE: We specifically DO NOT load cuda/12.0 here to avoid clashing with Conda's JAX wheels.
 
-# 2. Set your W&B API Key environment variable
+# 2. Set your W&B API Key
 export WANDB_API_KEY="5b9121798100cc1b68dd94823ced58122a9de2c0"
 
 # 3. Activate your custom Python 3.12 Conda Environment
 source $WORK/miniconda3/bin/activate
 conda activate nnx_env
 
-# 4. Identify the Ray Head Node
+# 4. Force JAX to use the pip-installed NVIDIA libraries (cuSPARSE, cuBLAS, etc.)
+NV_BASE=$WORK/miniconda3/envs/nnx_env/lib/python3.12/site-packages/nvidia
+export LD_LIBRARY_PATH=$NV_BASE/cusparse/lib:$NV_BASE/cublas/lib:$NV_BASE/cudnn/lib:$NV_BASE/cuda_runtime/lib:$NV_BASE/cuda_nvrtc/lib:$LD_LIBRARY_PATH
+
+# 5. Identify the Ray Head Node
 nodes=$(scontrol show hostnames "$SLURM_JOB_NODELIST")
 nodes_array=($nodes)
 head_node=${nodes_array[0]}
@@ -37,9 +42,9 @@ srun --nodes=1 --ntasks=1 -w "$head_node" \
     ray start --head --node-ip-address="$head_node_ip" --port=$port \
     --num-cpus=128 --num-gpus=3 --block &
 
-sleep 10 
+sleep 10 # Wait for head node to spin up
 
-# 5. Start the Ray Worker Nodes
+# 6. Start the Ray Worker Nodes
 worker_num=$((SLURM_JOB_NUM_NODES - 1))
 if [ "$worker_num" -gt 0 ]; then
     echo "Starting $worker_num Ray Workers..."
@@ -51,11 +56,11 @@ if [ "$worker_num" -gt 0 ]; then
     done
 fi
 
-sleep 10 
+sleep 10 # Wait for worker nodes to connect
 
-# 6. Execute your Python script
+# 7. Execute your Python script
 echo "Executing Python Sweep..."
 python train_sweep.py
 
-# 7. Cleanup
+# 8. Cleanup
 ray stop
