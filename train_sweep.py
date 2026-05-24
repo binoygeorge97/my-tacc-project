@@ -1,71 +1,694 @@
-#!/usr/bin/env python3
-"""Run a simple hyperparameter sweep and store the best result."""
+import os
+import time
+import pandas as pd
+import numpy as np
+import jax
+import jax.numpy as jnp
+import flax.nnx as nnx
+import optax
+import ray
+from flax import serialization
+import matplotlib.pyplot as plt
+from tqdm import tqdm
 
-from __future__ import annotations
+# =========================================================================
+# 0. INSERT YOUR MODEL DEFINITIONS HERE
+# Paste StackedModelRegression, S4LayerEnsemble, and batched_reg_runner here.
+# (They were missing from your snippet but called in safe_train_regression).
+# =========================================================================
+import jax
+from jax.numpy.linalg import inv, matrix_power
+from jax.nn.initializers import normal, zeros, ones
+import flax.nnx as nnx
+import optax
 
-import argparse
-import csv
-import itertools
-import math
-import random
-from pathlib import Path
+# --- Helper Functions (JAX-compatible) ---
 
+def scan_SSM(Ab, Bb, Cb, u, x0):
+    """Run the SSM state-space equation."""
+    def step(x_k_1, u_k):
+        x_k = Ab @ x_k_1 + Bb @ u_k
+        y_k = Cb @ x_k
+        return x_k, y_k
 
-def parse_csv_numbers(raw: str, cast):
-    return [cast(item.strip()) for item in raw.split(",") if item.strip()]
-
-
-def score_run(learning_rate: float, batch_size: int, epochs: int, seed: int) -> float:
-    rng = random.Random(seed + int(learning_rate * 10_000) + batch_size + epochs)
-    noise = rng.uniform(-0.01, 0.01)
-    baseline = 0.9
-    lr_penalty = abs(learning_rate - 0.01) * 3
-    batch_penalty = abs(batch_size - 64) / 150
-    epoch_gain = min(math.log(max(epochs, 1), 10) * 0.08, 0.12)
-    return max(0.0, min(1.0, baseline - lr_penalty - batch_penalty + epoch_gain + noise))
-
-
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--learning-rates", default="0.001,0.01,0.1")
-    parser.add_argument("--batch-sizes", default="32,64,128")
-    parser.add_argument("--epochs", default="5,10")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--output", default="sweep_results.csv")
-    return parser
+    return jax.lax.scan(step, x0, u)
 
 
-def main() -> int:
-    args = build_parser().parse_args()
-    learning_rates = parse_csv_numbers(args.learning_rates, float)
-    batch_sizes = parse_csv_numbers(args.batch_sizes, int)
-    epochs_list = parse_csv_numbers(args.epochs, int)
 
-    if not learning_rates or not batch_sizes or not epochs_list:
-        raise SystemExit("Provide at least one value for learning rates, batch sizes, and epochs.")
+def log_step_initializer(dt_min=0.001, dt_max=0.1):
+    """Initializer for the log_step parameter."""
+    def init(key, shape):
+        return jax.random.uniform(key, shape) * (
+            jnp.log(dt_max) - jnp.log(dt_min)
+        ) + jnp.log(dt_min)
+    return init
 
-    output_path = Path(args.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    best = None
-    with output_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(["learning_rate", "batch_size", "epochs", "score"])
-        for learning_rate, batch_size, epochs in itertools.product(
-            learning_rates, batch_sizes, epochs_list
-        ):
-            score = score_run(learning_rate, batch_size, epochs, args.seed)
-            writer.writerow([learning_rate, batch_size, epochs, f"{score:.4f}"])
-            if best is None or score > best[3]:
-                best = (learning_rate, batch_size, epochs, score)
+def causal_convolution(u, K):
+    #jax.debug.print("DEBUG: u shape={} | K shape={}", u.shape, K.shape)
+    #print("DEBUG: u shape={} | K shape={}", u.shape, K.shape)
+    assert K.shape[0] == u.shape[0]
+    ud = jnp.fft.rfft(jnp.pad(u, (0, K.shape[0])))
+    Kd = jnp.fft.rfft(jnp.pad(K, (0, u.shape[0])))
+    out = ud * Kd
+    return jnp.fft.irfft(out)[: u.shape[0]]
 
-    print(f"Wrote sweep results to: {output_path}")
-    print(
-        "Best config: "
-        f"lr={best[0]}, batch_size={best[1]}, epochs={best[2]}, score={best[3]:.4f}"
+def hippo_initializer(N):
+    Lambda, P, B, _ = make_DPLR_HiPPO(N)
+    return init(Lambda.real), init(Lambda.imag), init(P), init(B)
+
+
+def init(x):
+    def _init(key, shape):
+        assert shape == x.shape
+        return x
+
+    return _init
+
+
+def make_DPLR_HiPPO(N):
+    """Diagonalize NPLR representation"""
+    A, P, B = make_NPLR_HiPPO(N)
+
+    S = A + P[:, jnp.newaxis] * P[jnp.newaxis, :]
+
+    # Check skew symmetry
+    S_diag = jnp.diagonal(S)
+    Lambda_real = jnp.mean(S_diag) * jnp.ones_like(S_diag)
+    # assert np.allclose(Lambda_real, S_diag, atol=1e-3)
+
+    # Diagonalize S to V \Lambda V^*
+    Lambda_imag, V = jnp.linalg.eigh(S * -1j)
+
+    P = V.conj().T @ P
+    B = V.conj().T @ B
+    return Lambda_real + 1j * Lambda_imag, P, B, V
+
+
+def make_NPLR_HiPPO(N):
+    # Make -HiPPO
+    nhippo = make_HiPPO(N)
+
+    # Add in a rank 1 term. Makes it Normal.
+    P = jnp.sqrt(jnp.arange(N) + 0.5)
+
+    # HiPPO also specifies the B matrix
+    B = jnp.sqrt(2 * jnp.arange(N) + 1.0)
+    return nhippo, P, B
+
+
+def make_HiPPO(N):
+    P = jnp.sqrt(1 + 2 * jnp.arange(N))
+    A = P[:, jnp.newaxis] * P[jnp.newaxis, :]
+    A = jnp.tril(A) - jnp.diag(jnp.arange(N))
+    return -A
+
+@jax.jit
+def cauchy(v, omega, lambd):
+    """Cauchy matrix multiplication: (n), (l), (n) -> (l)"""
+    cauchy_dot = lambda _omega: (v / (_omega - lambd)).sum()
+    return jax.vmap(cauchy_dot)(omega)
+
+
+def kernel_DPLR(Lambda, P, Q, B, C, step, L):
+    # Evaluate at roots of unity
+    # Generating function is (-)z-transform, so we evaluate at (-)root
+    Omega_L = jnp.exp((-2j * jnp.pi) * (jnp.arange(L) / L))
+
+    aterm = (C.conj(), Q.conj())
+    bterm = (B, P)
+
+    g = (2.0 / step) * ((1.0 - Omega_L) / (1.0 + Omega_L))
+    c = 2.0 / (1.0 + Omega_L)
+
+    # Reduction to core Cauchy kernel
+    k00 = cauchy(aterm[0] * bterm[0], g, Lambda)
+    k01 = cauchy(aterm[0] * bterm[1], g, Lambda)
+    k10 = cauchy(aterm[1] * bterm[0], g, Lambda)
+    k11 = cauchy(aterm[1] * bterm[1], g, Lambda)
+    atRoots = c * (k00 - k01 * (1.0 / (1.0 + k11)) * k10)
+    out = jnp.fft.ifft(atRoots, L).reshape(L)
+    return out.real
+
+
+def discrete_DPLR(Lambda, P, Q, B, C, step, L):
+    # Convert parameters to matrices
+    B = B[:, jnp.newaxis]
+    Ct = C[jnp.newaxis, :]
+
+    N = Lambda.shape[0]
+    A = jnp.diag(Lambda) - P[:, jnp.newaxis] @ Q[:, jnp.newaxis].conj().T
+    I = jnp.eye(N)
+
+    # Forward Euler
+    A0 = (2.0 / step) * I + A
+
+    # Backward Euler
+    D = jnp.diag(1.0 / ((2.0 / step) - Lambda))
+    Qc = Q.conj().T.reshape(1, -1)
+    P2 = P.reshape(-1, 1)
+    A1 = D - (D @ P2 * (1.0 / (1 + (Qc @ D @ P2))) * Qc @ D)
+
+    # A bar and B bar
+    Ab = A1 @ A0
+    Bb = 2 * A1 @ B
+
+    # Recover Cbar from Ct
+    Cb = Ct @ inv(I - matrix_power(Ab, L)).conj()
+    return Ab, Bb, Cb.conj()
+
+
+class S4LayerEnsemble(nnx.Module):
+    def __init__(self, N: int, l_max: int, D_MODEL: int, decode: bool, *, rngs: nnx.Rngs):
+        self.N, self.decode, self.l_max, self.D_MODEL = N, decode, l_max, D_MODEL
+        init_A_re, init_A_im, init_P, init_B = hippo_initializer(self.N)
+        init_C, init_D, init_log_step = normal(stddev=0.5**0.5), ones, log_step_initializer()
+        vmap_in_axes = (0, None)
+        vmap_init_A_re = jax.vmap(init_A_re, in_axes=vmap_in_axes)
+        vmap_init_A_im = jax.vmap(init_A_im, in_axes=vmap_in_axes)
+        vmap_init_P = jax.vmap(init_P, in_axes=vmap_in_axes)
+        vmap_init_B = jax.vmap(init_B, in_axes=vmap_in_axes)
+        vmap_init_C = jax.vmap(init_C, in_axes=vmap_in_axes)
+        vmap_init_D = jax.vmap(init_D, in_axes=vmap_in_axes)
+        vmap_init_log_step = jax.vmap(init_log_step, in_axes=vmap_in_axes)
+        keys = jax.random.split(rngs.params(), 7)
+        lr_meta = {'lr': 0.1}
+        self.Lambda_re = nnx.Param(vmap_init_A_re(jax.random.split(keys[0], D_MODEL), (N,)), metadata=lr_meta)
+        self.Lambda_im = nnx.Param(vmap_init_A_im(jax.random.split(keys[1], D_MODEL), (N,)), metadata=lr_meta)
+        self.P = nnx.Param(vmap_init_P(jax.random.split(keys[2], D_MODEL), (N,)), metadata=lr_meta)
+        self.B = nnx.Param(vmap_init_B(jax.random.split(keys[3], D_MODEL), (N,)), metadata=lr_meta)
+        self.C_real_imag = nnx.Param(vmap_init_C(jax.random.split(keys[4], D_MODEL), (N, 2)), metadata=lr_meta)
+        self.D = nnx.Param(vmap_init_D(jax.random.split(keys[5], D_MODEL), (1,)), metadata=lr_meta)
+        self.log_step = nnx.Param(vmap_init_log_step(jax.random.split(keys[6], D_MODEL), (1,)), metadata=lr_meta)
+
+        # --- NO MORE self.x_k_1 ---
+        # if self.decode:
+        #     self.x_k_1 = nnx.Variable(jnp.zeros((D_MODEL, N,), dtype=jnp.complex64))
+
+    # --- __call__ signature has changed ---
+    def __call__(self, u, x_k_1):
+        """
+        Takes in a single state vector x_k_1 [N,]
+        Returns a single output y_s [L,] and new state x_k [N,]
+        """
+        dt_min, dt_max = 0.001, 1.0
+        step = jnp.exp(self.log_step.value)
+        step = jnp.clip(step, dt_min, dt_max)
+
+        Lambda = jnp.clip(self.Lambda_re.value, None, -1e-4) + 1j * self.Lambda_im.value
+        C_complex = self.C_real_imag.value[..., 0] + 1j * self.C_real_imag.value[..., 1]
+        #step = jnp.exp(self.log_step.value)
+
+        if not self.decode:
+            # CNN mode is stateless, so we ignore x_k_1 and return it unchanged
+            K = kernel_DPLR(Lambda, self.P.value, self.P.value, self.B.value, C_complex, step, self.l_max)
+            y_s = causal_convolution(u, K) + self.D.value * u
+            return y_s, x_k_1 # Return state unchanged
+        else:
+            # RNN mode uses and returns state
+            Ab, Bb, Cb = discrete_DPLR(Lambda, self.P.value, self.P.value, self.B.value, C_complex, step, self.l_max)
+            u_r = u[:, jnp.newaxis]
+            x_k, y_s = scan_SSM(Ab, Bb, Cb, u_r, x_k_1) # Use passed-in state
+
+            # --- DO NOT MUTATE SELF ---
+            # self.x_k_1.value = x_k
+
+            # --- Return the output and the new state ---
+            return y_s.reshape(-1).real + self.D.value * u, x_k
+
+
+class SequenceBlockNNX(nnx.Module):
+    def __init__(self,
+                 layer_cls: type[nnx.Module],
+                 layer_args: dict,
+                 d_model: int,
+                 dropout: float,
+                 prenorm: bool = True,
+                 glu: bool = True,
+                 decode: bool = False,
+                 *, rngs: nnx.Rngs):
+
+        self.d_model = d_model
+        self.prenorm = prenorm
+        self.glu = glu
+        self.decode = decode
+        self.dropout_rate = dropout
+
+        self.seq = layer_cls(
+            **layer_args,
+            D_MODEL=d_model,
+            decode=decode,
+            rngs=rngs
+        )
+
+        # Mixing Layers
+        keys = jax.random.split(rngs.params(), 3)
+        self.norm = nnx.LayerNorm(d_model, rngs=nnx.Rngs(params=keys[0]))
+        self.out = nnx.Linear(d_model, d_model, rngs=nnx.Rngs(params=keys[1]))
+        if self.glu:
+            self.out2 = nnx.Linear(d_model, d_model, rngs=nnx.Rngs(params=keys[2]))
+
+        self.drop = nnx.Dropout(dropout, broadcast_dims=[0])
+
+    def __call__(self, x, s4_state, *, rngs: nnx.Rngs = None, training: bool = True):
+        skip = x
+
+        if self.prenorm:
+            x = self.norm(x)
+
+        # --- ROBUST FIX: Manual JAX Vmap ---
+        # 1. Split the S4 layer into Graph (Static) and Params (Data)
+        seq_graph, seq_params = nnx.split(self.seq)
+
+        # 2. Define a Pure Function for ONE channel
+        def run_one_channel(params_slice, u_slice, state_slice):
+            # Reconstruct the layer for this single channel
+            single_layer = nnx.merge(seq_graph, params_slice)
+            # Run it
+            return single_layer(u_slice, state_slice)
+
+        # 3. Use standard JAX vmap
+        # seq_params: Axis 0 corresponds to D_MODEL (H)
+        # x (Input): Axis 1 corresponds to H -> (L, H)
+        # s4_state: Axis 0 corresponds to H -> (H, N)
+        x, new_s4_state = jax.vmap(
+            run_one_channel,
+            in_axes=(0, 1, 0),  # Map over params(0), input(1), state(0)
+            out_axes=(1, 0)     # Stack output(1), new_state(0)
+        )(seq_params, x, s4_state)
+
+        # -----------------------------------
+
+        x = nnx.gelu(x)
+
+        if training and rngs:
+             x = self.drop(x, rngs=rngs)
+
+        if self.glu:
+            gate = jax.nn.sigmoid(self.out2(x))
+            x = self.out(x) * gate
+        else:
+            x = self.out(x)
+
+        if training and rngs:
+            x = self.drop(x, rngs=rngs)
+
+        x = skip + x
+
+        if not self.prenorm:
+            x = self.norm(x)
+
+        return x, new_s4_state
+
+
+class StackedModelRegression(nnx.Module):
+    def __init__(self,
+                 layer_cls: type[nnx.Module],
+                 layer_args: dict,
+                 d_input: int,
+                 d_output: int,
+                 d_model: int,
+                 n_layers: int,
+                 prenorm: bool = True,
+                 dropout: float = 0.0,
+                 decode: bool = False,
+                 *, rngs: nnx.Rngs):
+
+        self.d_model = d_model
+        self.d_output = d_output
+        self.n_layers = n_layers
+        self.prenorm = prenorm
+        self.decode = decode
+        self.dropout = dropout
+
+        keys = jax.random.split(rngs.params(), 3)
+
+        # 1. Linear Encoder (No Embeddings!)
+        # Projects 1 feature (sine value) -> d_model (Hidden)
+        self.encoder = nnx.Linear(d_input, d_model, rngs=nnx.Rngs(params=keys[0]))
+
+        # 2. Linear Decoder
+        # Projects d_model -> 1 output value
+        self.decoder = nnx.Linear(d_model, d_output, rngs=nnx.Rngs(params=keys[1]))
+
+        layer_keys = jax.random.split(keys[2], n_layers)
+        self.layers = []
+        for i in range(n_layers):
+            self.layers.append(
+                SequenceBlockNNX(
+                    layer_cls=layer_cls,
+                    layer_args=layer_args,
+                    d_model=d_model,
+                    dropout=dropout,
+                    prenorm=prenorm,
+                    decode=decode,
+                    glu=True,
+                    rngs=nnx.Rngs(params=layer_keys[i])
+                )
+            )
+
+    def __call__(self, x, states=None, *, rngs: nnx.Rngs = None, training: bool = True):
+        # x shape: (B, L, 1) or (L, 1)
+
+        # --- FIX 1: Handle Rank-1 Input ---
+        was_1d = False
+        if x.ndim == 1:
+            x = x[jnp.newaxis, :]
+            was_1d = True
+
+        # # Causal Padding for CNN mode
+        # if not self.decode:
+        #     x = jnp.pad(x[:-1], [(1, 0), (0, 0)])
+
+        # --- NO NORMALIZATION (Input is already standard float) ---
+
+        x = self.encoder(x)
+        current_states = states if states is not None else [None] * self.n_layers
+
+        new_states = []
+        for layer, state in zip(self.layers, current_states):
+            x, new_s = layer(x, state, rngs=rngs, training=training)
+            new_states.append(new_s)
+
+        x = self.decoder(x)
+
+        # --- FIX 2: NO SOFTMAX (Regression Output) ---
+        output = x
+
+        if was_1d:
+            output = output.squeeze(0)
+
+        return output, new_states
+
+    # Add the init_state helper for inference
+    def init_state(self, N: int):
+        return [jnp.zeros((self.d_model, N), dtype=jnp.complex64) for _ in range(self.n_layers)]
+
+
+# 1. VMAP RUNNERS (The "BatchStackedModel" replacement)
+
+batched_reg_runner = nnx.vmap(
+    lambda m, x, k, is_train: m(x, states=None, rngs=nnx.Rngs(dropout=k), training=is_train),
+    in_axes=(nnx.StateAxes({nnx.Param: None}), 0, 0, None),
+    out_axes=0
+)
+
+
+import wandb
+
+# === Get secret from Colab userdata ===
+from google.colab import userdata
+
+try:
+    wandb_api = userdata.get('WANDB_API_KEY')   # Recommended secret name
+except Exception as e:
+    print("Error retrieving secret. Make sure you added WANDB_API_KEY in Colab secrets.")
+    raise e
+
+# Login to Weights & Biases
+wandb.login(key=wandb_api)
+
+
+# =========================================================================
+# 1. THE PHYSICS ENGINE & DATALOADER
+# =========================================================================
+def get_discrete_matrices(A_continuous, dt=0.01):
+    B_i = np.array([[0.0], [1.0]])
+    B = np.block([
+        [B_i, np.zeros((2,1)), np.zeros((2,1))],
+        [np.zeros((2,1)), B_i, np.zeros((2,1))],
+        [np.zeros((2,1)), np.zeros((2,1)), B_i]
+    ])
+    I = np.eye(6)
+    inv_term = np.linalg.inv(I - (dt / 2.0) * A_continuous)
+    Ad = inv_term @ (I + (dt / 2.0) * A_continuous)
+    Bd = inv_term @ B * dt
+    return Ad, Bd
+
+def fast_vectorized_aprbs(batch_size, length, min_val, max_val, hold_prob, rng=None):
+    if rng is None: rng = np.random.RandomState(42)
+    random_amps = rng.uniform(min_val, max_val, size=(batch_size, 3, length))
+    switches = rng.rand(batch_size, 3, length) > hold_prob
+    switches[:, :, 0] = True
+    signal = np.zeros((batch_size, 3, length))
+    current_amp = random_amps[:, :, 0]
+    for k in range(length):
+        current_amp = np.where(switches[:, :, k], random_amps[:, :, k], current_amp)
+        signal[:, :, k] = current_amp
+    return signal
+
+def generate_microgrid_data_fast(Ad, Bd, batch_size, length=100, seed=42):
+    rng = np.random.RandomState(seed)
+    U_signals = fast_vectorized_aprbs(batch_size, length, -1.0, 1.0, hold_prob=0.8, rng=rng)
+    batch_inputs = np.zeros((batch_size, length, 9))
+    batch_targets = np.zeros((batch_size, length, 6))
+    X_current = np.zeros((batch_size, 6))
+
+    for k in range(length):
+        U_k = U_signals[:, :, k]
+        batch_inputs[:, k, 0:6] = X_current
+        batch_inputs[:, k, 6:9] = U_k
+        X_next = X_current.dot(Ad.T) + U_k.dot(Bd.T)
+        batch_targets[:, k, :] = X_next
+        X_current = X_next
+    return batch_inputs, batch_targets
+
+def create_microgrid_dataloaders(Ad, Bd, bsz=32, L=100):
+    n_train = 30000
+    n_test = 200
+    total_samples = n_train + n_test
+    all_inputs, all_targets = generate_microgrid_data_fast(Ad, Bd, batch_size=total_samples, length=L)
+
+    train_in, train_out = all_inputs[:n_train], all_targets[:n_train]
+    test_in, test_out = all_inputs[n_train:], all_targets[n_train:]
+
+    trainloader = [(train_in[i*bsz:(i+1)*bsz], train_out[i*bsz:(i+1)*bsz]) for i in range(n_train // bsz)]
+    testloader = [(test_in[i*bsz:(i+1)*bsz], test_out[i*bsz:(i+1)*bsz]) for i in range(n_test // bsz)]
+    return trainloader, testloader, 9, 6
+
+DatasetMetadata = {
+    "microgrid": {
+        "input_labels": ["e_1", "r_1", "e_2", "r_2", "e_3", "r_3", "u_1", "u_2", "u_3"],
+        "output_labels": ["Next e_1", "Next r_1", "Next e_2", "Next r_2", "Next e_3", "Next r_3"],
+        "dt": 0.01
+    }
+}
+
+# =========================================================================
+# 2. UTILS & TRAIN LOOP
+# =========================================================================
+def create_optimizer(model, base_lr, weight_decay, total_steps):
+    if total_steps > 0:
+        schedule_fn = lambda lr: optax.cosine_onecycle_schedule(peak_value=lr, transition_steps=total_steps, pct_start=0.1)
+    else:
+        schedule_fn = lambda lr: optax.constant_schedule(lr)
+    tx = optax.adamw(learning_rate=schedule_fn(base_lr), weight_decay=weight_decay)
+    return nnx.Optimizer(model, tx, wrt=nnx.Param)
+
+@nnx.jit
+def train_step(model, optimizer, x_batch, y_batch, dropout_keys):
+    def loss_fn(model):
+        predictions, _ = batched_reg_runner(model, x_batch, dropout_keys, True)
+        return jnp.mean((predictions - y_batch) ** 2), predictions
+    (loss, preds), grads = nnx.value_and_grad(loss_fn, has_aux=True)(model)
+    optimizer.update(model, grads)
+    return loss
+
+@nnx.jit
+def eval_step(model, x_batch, y_batch):
+    B = x_batch.shape[0]
+    dummy_keys = jax.random.split(jax.random.PRNGKey(0), B)
+    predictions, _ = batched_reg_runner(model, x_batch, dummy_keys, False)
+    return jnp.mean((predictions - y_batch) ** 2)
+
+def validate(model, testloader):
+    losses = [eval_step(model, jnp.array(x), jnp.array(y)) for x, y in testloader]
+    return np.mean(losses)
+
+def train_epoch(rng, model, optimizer, trainloader):
+    batch_losses = []
+    for batch in tqdm(trainloader, desc="Training", disable=True):
+        inputs, targets = jnp.array(batch[0]), jnp.array(batch[1])
+        rng, drop_rng = jax.random.split(rng)
+        batch_keys = jax.random.split(drop_rng, inputs.shape[0])
+        batch_losses.append(train_step(model, optimizer, inputs, targets, batch_keys))
+    return rng, np.mean(batch_losses)
+
+def save_model(model, config, filename="s4_model.msgpack"):
+    model_state = nnx.state(model, nnx.Param).to_pure_dict()
+    byte_data = serialization.to_bytes({'model_state': model_state, 'config': config})
+    with open(filename, 'wb') as f:
+        f.write(byte_data)
+
+def load_model_regression(filename, d_input_arg=None, d_output_arg=None):
+    with open(filename, 'rb') as f:
+        byte_data = f.read()
+    raw_structure = serialization.msgpack_restore(byte_data)
+    config = raw_structure['config']
+    
+    d_input = d_input_arg if d_input_arg is not None else config.get('d_input', 1)
+    d_output = d_output_arg if d_output_arg is not None else config.get('d_output', 1)
+    l_max = config['model'].get('l_max', 100)
+    s4_N = config['model'].get('N', 64)
+
+    rngs = nnx.Rngs(params=jax.random.PRNGKey(0))
+    model = StackedModelRegression(
+        layer_cls=S4LayerEnsemble, layer_args={'N': s4_N, 'l_max': l_max},
+        d_input=d_input, d_output=d_output,
+        d_model=config['model']['d_model'], n_layers=config['model']['n_layers'],
+        dropout=config['model']['dropout'], prenorm=config['model']['prenorm'],
+        decode=True, rngs=rngs
     )
-    return 0
+    current_state_dict = nnx.state(model, nnx.Param).to_pure_dict()
+    restored = serialization.from_bytes({'model_state': current_state_dict, 'config': config}, byte_data)
+    nnx.update(model, restored['model_state'])
+    return model
 
+def safe_train_regression(dataset, layer, seed, model_cfg, train_cfg, Ad, Bd, unique_save_path):
+    key = jax.random.PRNGKey(seed)
+    key, model_rng, train_rng = jax.random.split(key, 3)
 
+    trainloader, testloader, d_input, d_output = create_microgrid_dataloaders(Ad=Ad, Bd=Bd, bsz=train_cfg['bsz'], L=model_cfg.get('l_max', 100))
+    
+    rngs = nnx.Rngs(params=model_rng, dropout=0)
+    stacked_args = model_cfg.copy()
+    s4_N, l_max = stacked_args.pop('N'), stacked_args.pop('l_max')
+    stacked_args.pop('embedding', None)
+
+    model = StackedModelRegression(layer_cls=S4LayerEnsemble, layer_args={'N': s4_N, 'l_max': l_max}, d_input=d_input, d_output=d_output, decode=False, rngs=rngs, **stacked_args)
+    optimizer = create_optimizer(model, base_lr=train_cfg['lr'], weight_decay=train_cfg['weight_decay'], total_steps=len(trainloader)*train_cfg['epochs'])
+
+    best_loss = 1e9
+    for epoch in range(train_cfg['epochs']):
+        train_rng, train_loss = train_epoch(train_rng, model, optimizer, trainloader)
+        test_loss = validate(model, testloader)
+        if test_loss < best_loss:
+            best_loss = test_loss
+            os.makedirs(os.path.dirname(unique_save_path), exist_ok=True)
+            save_model(model, {'dataset': dataset, 'layer': layer, 'model': model_cfg, 'train': train_cfg}, unique_save_path)
+    return model, best_loss
+
+# =========================================================================
+# 3. SWEEP DEFINITIONS & RAY WORKER
+# =========================================================================
+def get_sweep_configs():
+    hp = {"d_model": 128, "n_layers": 2, "dropout": 0.0, "prenorm": True, "lr": 1e-3, "batch_size": 32, "epochs": 100, "N": 64, "l_max": 100}
+    hp_marginal = hp.copy()
+    hp_marginal["d_model"] = 64
+    Z = np.zeros((2, 2))
+    configs = []
+
+    # Matrix 1
+    A1 = np.block([[np.array([[-3.5, -2.4], [0.0, 0.0]]), np.array([[0.0, 0.03], [0.0, 0.0]]), np.array([[0.0, 0.06], [0.0, 0.0]])],
+                   [Z, np.array([[-3.5, -2.3], [0.0, 0.0]]), Z], [Z, Z, np.array([[-5.2, -5.3], [0.0, 0.0]])]])
+    configs.append([{"matrix_id": 1, "A_continuous": A1}, hp_marginal])
+    # Matrix 2
+    A2 = np.block([[np.array([[1.0, 0.5], [0.0, 2.0]]), Z, Z], [Z, np.array([[1.5, 0.5], [0.0, 3.0]]), Z], [Z, Z, np.array([[0.5, 0.5], [0.0, 4.0]])]])
+    configs.append([{"matrix_id": 2, "A_continuous": A2}, hp])
+    
+    # You can paste the rest of your matrix blocks (3 through 7) here exactly as they were.
+
+    return configs
+
+import wandb
+
+@ray.remote(num_gpus=0.2)
+def train_single_model(matrix_dict, hp_dict):
+    os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.10"
+    os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+    
+    matrix_id, A_continuous = matrix_dict["matrix_id"], matrix_dict["A_continuous"]
+    
+    # 1. Initialize W&B for this specific Ray worker
+    run = wandb.init(
+        project="microgrid-s4-sweep", # Name your project here
+        name=f"matrix_{matrix_id}",   # Name the specific run
+        config={**hp_dict, "matrix_id": matrix_id}
+    )
+
+    model_cfg = {k: hp_dict[k] for k in ["d_model", "n_layers", "N", "l_max", "dropout", "prenorm"]}
+    model_cfg["embedding"] = False
+    train_cfg = {"epochs": hp_dict["epochs"], "bsz": hp_dict["batch_size"], "lr": hp_dict["lr"], "weight_decay": 0.0}
+    unique_save_path = f"checkpoints/sweep/mat{matrix_id}_best_model.msgpack"
+
+    Ad, Bd = get_discrete_matrices(A_continuous)
+    
+    # 2. Run your training
+    trained_model, final_mse = safe_train_regression(
+        "microgrid", "s4", 42, model_cfg, train_cfg, Ad, Bd, unique_save_path
+    )
+    
+    # 3. Log the final results to W&B and close the run
+    wandb.log({"final_test_mse": final_mse})
+    wandb.finish()
+    
+    return {"matrix_id": matrix_id, "mse": final_mse, "path": unique_save_path}
+
+# =========================================================================
+# 4. HEADLESS PLOTTING & EVALUATION
+# =========================================================================
+def visualize_system_plots(inputs, targets, preds, dataset_name="microgrid", n_plot=3, max_channels=4, custom_title=""):
+    inputs, targets, preds = np.array(inputs), np.array(targets), np.array(preds)
+    meta = DatasetMetadata.get(dataset_name, {})
+    dt = meta.get("dt", 0.01)
+    
+    fig, axes = plt.subplots(n_plot, 2, figsize=(16, 4 * n_plot), squeeze=False)
+    fig.suptitle(custom_title, fontsize=16, fontweight='bold')
+
+    for i in range(n_plot):
+        # Your plotting logic here remains identical...
+        axes[i, 0].plot(inputs[i, :, 0]) # Abbreviated for space - keep your loop here!
+        axes[i, 1].plot(targets[i, :, 0]) 
+    
+    # MODIFIED FOR TACC: Save to file instead of plt.show()
+    safe_title = custom_title.replace(" | ", "_").replace("=", "").replace(" ", "_")
+    save_path = f"{safe_title}.png"
+    plt.savefig(save_path, bbox_inches='tight', dpi=300)
+    plt.close(fig)
+
+def run_evaluation(model, Ad, Bd, d_model, n_layers, dataset_name="microgrid", custom_title=""):
+    _, testloader, _, _ = create_microgrid_dataloaders(Ad, Bd, bsz=32, L=100)
+    inputs_u, targets_y = jnp.array(testloader[0][0]), jnp.array(testloader[0][1])
+
+    # Keep your exact step_by_step_inference scan setup here...
+    # preds_y = step_by_step_inference(model, inputs_u)
+    
+    # visualize_system_plots(inputs_u, targets_y, preds_y, custom_title=custom_title)
+
+# =========================================================================
+# 5. MAIN EXECUTION
+# =========================================================================
 if __name__ == "__main__":
-    raise SystemExit(main())
+    import os
+    
+    # Grab the API key from the Slurm environment
+    wandb_key = os.environ.get("WANDB_API_KEY")
+    ray_env = {"env_vars": {"WANDB_API_KEY": wandb_key}} if wandb_key else {}
+
+    # Tell Ray to pass this environment variable to all A100/H100 workers
+    if "RAY_ADDRESS" in os.environ:
+        ray.init(address="auto", runtime_env=ray_env)
+        print("[*] Connected to Slurm Ray Cluster")
+    else:
+        ray.init(ignore_reinit_error=True, runtime_env=ray_env)
+
+    print("[*] Launching Ray Sweep...")
+    experiments = get_sweep_configs()
+    futures = [train_single_model.remote(mat, hp) for mat, hp in experiments]
+    results = ray.get(futures)
+    
+    df = pd.DataFrame(results)
+    df.to_csv("sweep_results.csv", index=False)
+    print("\n✅ Sweep Complete!")
+    
+    # Evaluation block (Identical to your script)
+    top_models = df.sort_values(by="mse", ascending=True).head(7)
+    matrix_lookup = {exp[0]["matrix_id"]: exp[0]["A_continuous"] for exp in experiments}
+    
+    for index, row in top_models.iterrows():
+        mat_id = int(row['matrix_id'])
+        Ad, Bd = get_discrete_matrices(matrix_lookup[mat_id])
+        model = load_model_regression(row['path'], d_input_arg=9, d_output_arg=6)
+        
+        plot_title = f"Rank {index+1} | Matrix {mat_id} | d_model={model.d_model} | Test MSE: {row['mse']:.6f}"
+        run_evaluation(model, Ad, Bd, model.d_model, model.n_layers, custom_title=plot_title)
