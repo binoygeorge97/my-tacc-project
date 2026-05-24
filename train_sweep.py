@@ -549,6 +549,16 @@ def safe_train_regression(dataset, layer, seed, model_cfg, train_cfg, Ad, Bd, un
     for epoch in range(train_cfg['epochs']):
         train_rng, train_loss = train_epoch(train_rng, model, optimizer, trainloader)
         test_loss = validate(model, testloader)
+        
+        # --- NEW: Log epoch-level data to W&B ---
+        import wandb
+        wandb.log({
+            "epoch": epoch + 1,
+            "train_loss": train_loss,
+            "test_loss": test_loss
+        })
+        # ----------------------------------------
+
         if test_loss < best_loss:
             best_loss = test_loss
             os.makedirs(os.path.dirname(unique_save_path), exist_ok=True)
@@ -573,7 +583,78 @@ def get_sweep_configs():
     A2 = np.block([[np.array([[1.0, 0.5], [0.0, 2.0]]), Z, Z], [Z, np.array([[1.5, 0.5], [0.0, 3.0]]), Z], [Z, Z, np.array([[0.5, 0.5], [0.0, 4.0]])]])
     configs.append([{"matrix_id": 2, "A_continuous": A2}, hp])
     
-    # You can paste the rest of your matrix blocks (3 through 7) here exactly as they were.
+    # ==========================================
+    # 3. Oscillatory unstable (complex eigenvalues)
+    # ==========================================
+    A4_3 = np.array([[ 1.0,  2.0], [-2.0,  1.0]])
+    A5_3 = np.array([[ 2.0,  5.0], [-5.0,  2.0]])
+    A6_3 = np.array([[ 1.5, 10.0], [-10.0, 1.5]])
+
+    A3 = np.block([
+        [A4_3, Z, Z],
+        [Z, A5_3, Z],
+        [Z, Z, A6_3]
+    ])
+    configs.append([{"matrix_id": 3, "A_continuous": A3}, hp])
+
+    # ==========================================
+    # 4. Non-normal Jordan block
+    # ==========================================
+    A4_4 = np.array([[1.0, 100.0], [0.0, 1.0]])
+    A5_4 = np.array([[1.5,  80.0], [0.0, 1.5]])
+    A6_4 = np.array([[2.0, 120.0], [0.0, 2.0]])
+
+    A4 = np.block([
+        [A4_4, Z, Z],
+        [Z, A5_4, Z],
+        [Z, Z, A6_4]
+    ])
+    configs.append([{"matrix_id": 4, "A_continuous": A4}, hp])
+
+    # ==========================================
+    # 5. Weakly coupled unstable (transition case)
+    # ==========================================
+    A4_5 = np.array([[1.0, 1.0], [0.0, 2.0]])
+    A5_5 = np.array([[1.5, 0.7], [0.0, 3.0]])
+    A6_5 = np.array([[0.5, 1.2], [0.0, 4.0]])
+    H45_5 = np.array([[ 0.3, -0.2], [ 0.0,  0.4]])
+    H46_5 = np.array([[ 0.1,  0.0], [ 0.0, -0.3]])
+    H56_5 = np.array([[ 0.25, -0.15], [ 0.0,   0.2]])
+
+    A5 = np.block([
+        [A4_5, H45_5, H46_5],
+        [Z,    A5_5,  H56_5],
+        [Z,    Z,     A6_5 ]
+    ])
+    configs.append([{"matrix_id": 5, "A_continuous": A5}, hp])
+
+    # ==========================================
+    # 6. Ill-conditioned eigenvectors
+    # ==========================================
+    A4_6 = np.array([[1.0, 1000.0], [0.001,   1.0]])
+    A5_6 = np.array([[1.5,  800.0], [0.002,   1.5]])
+    A6_6 = np.array([[2.0, 1200.0], [0.0015,  2.0]])
+
+    A6 = np.block([
+        [A4_6, Z, Z],
+        [Z, A5_6, Z],
+        [Z, Z, A6_6]
+    ])
+    configs.append([{"matrix_id": 6, "A_continuous": A6}, hp])
+
+    # ==========================================
+    # 7. Mixed stable / unstable modes
+    # ==========================================
+    A4_7 = np.array([[-2.0, 0.5], [ 0.0, 0.5]])
+    A5_7 = np.array([[-1.0, 0.5], [ 0.0, 1.5]])
+    A6_7 = np.array([[-3.0, 0.5], [ 0.0, 2.0]])
+
+    A7 = np.block([
+        [A4_7, Z, Z],
+        [Z, A5_7, Z],
+        [Z, Z, A6_7]
+    ])
+    configs.append([{"matrix_id": 7, "A_continuous": A7}, hp])
 
     return configs
 
