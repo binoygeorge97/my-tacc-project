@@ -5,35 +5,24 @@
 #SBATCH -p gpu-a100                 # Change to gpu-h100 if you want the H100 nodes
 #SBATCH -N 3                        # Requesting 3 nodes
 #SBATCH -n 3                        # 3 tasks (1 per node)
-#SBATCH -t 01:00:00                 # Max runtime (1 hour)
-#SBATCH -A IRI26016                 # <--- REPLACE WITH YOUR TACC PROJECT CODE
+#SBATCH -t 01:00:00                 # Max runtime (2 hours)
+#SBATCH -A IRI26016        # <--- REPLACE WITH YOUR TACC PROJECT CODE
+#SBATCH --mail-user=phdstudiescontrols@gmail.com
+#SBATCH --mail-type=BEGIN,END,FAIL
 
-# 1. Load Modules
-module load gcc/12.2.0  # Good practice to load a newer compiler on TACC
-module load python3/3.12
-module load cuda/12.8
+# 1. Load Core TACC Modules (No system python!)
+module purge
+module load TACC
+module load cuda/12.0
 
-# Add your W&B API Key here!
+# 2. Set your W&B API Key environment variable
 export WANDB_API_KEY="5b9121798100cc1b68dd94823ced58122a9de2c0"
 
+# 3. Activate your custom Python 3.12 Conda Environment
+source $WORK/miniconda3/bin/activate
+conda activate nnx_env
 
-# --- Email Notifications ---
-#SBATCH --mail-user=phdstudiescontrols@gmail.com
-#SBATCH --mail-type=BEGIN,END,FAIL 
-
-
-# 2. Setup Virtual Environment (Runs once if it doesn't exist)
-if [ ! -d "$WORK/nnx_env" ]; then
-    echo "Creating virtual environment..."
-    python3 -m venv $WORK/nnx_env
-    source $WORK/nnx_env/bin/activate
-    pip install -U pip
-    pip install -r requirements.txt
-else
-    source $WORK/nnx_env/bin/activate
-fi
-
-# 3. Identify the Ray Head Node
+# 4. Identify the Ray Head Node
 nodes=$(scontrol show hostnames "$SLURM_JOB_NODELIST")
 nodes_array=($nodes)
 head_node=${nodes_array[0]}
@@ -48,9 +37,9 @@ srun --nodes=1 --ntasks=1 -w "$head_node" \
     ray start --head --node-ip-address="$head_node_ip" --port=$port \
     --num-cpus=128 --num-gpus=3 --block &
 
-sleep 10 # Wait for head node
+sleep 10 
 
-# 4. Start the Ray Worker Nodes
+# 5. Start the Ray Worker Nodes
 worker_num=$((SLURM_JOB_NUM_NODES - 1))
 if [ "$worker_num" -gt 0 ]; then
     echo "Starting $worker_num Ray Workers..."
@@ -62,11 +51,11 @@ if [ "$worker_num" -gt 0 ]; then
     done
 fi
 
-sleep 10 # Wait for workers
+sleep 10 
 
-# 5. Execute your Python script
+# 6. Execute your Python script
 echo "Executing Python Sweep..."
 python train_sweep.py
 
-# 6. Cleanup
+# 7. Cleanup
 ray stop
