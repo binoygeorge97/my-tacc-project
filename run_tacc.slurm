@@ -1,4 +1,3 @@
-
 #!/bin/bash
 #SBATCH -J nnx_sweep
 #SBATCH -o nnx_sweep_%j.out
