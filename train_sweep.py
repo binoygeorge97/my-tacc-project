@@ -601,7 +601,7 @@ def train_single_model(matrix_dict, hp_dict):
     
     # 1. Initialize W&B for this specific Ray worker
     run = wandb.init(
-        project="microgrid-s4-sweep", # Name your project here
+        project="tacc-microgrid-s4-sweep", # Name your project here
         name=f"matrix_{matrix_id}",   # Name the specific run
         config={**hp_dict, "matrix_id": matrix_id}
     )
