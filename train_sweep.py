@@ -11,23 +11,19 @@ from flax import serialization
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
-# =========================================================================
-# 0. INSERT YOUR MODEL DEFINITIONS & CUSTOM S4 MODULE HERE
-# =========================================================================
-import jax
-from jax.numpy.linalg import inv, matrix_power
-from jax.nn.initializers import normal, zeros, ones
-import flax.nnx as nnx
-import optax
 
-from s4_code import (
+# =========================================================================
+# 0. LOCAL MODULE IMPORTS
+# =========================================================================
+# Import from the 'model' folder
+from model.s4_code import (
     StackedModelRegression, 
     S4LayerEnsemble, 
     batched_reg_runner
 )
 
-# Import the system dynamics and data generators
-from dataloader import (
+# Import from the 'data' folder
+from data.dataloader import (
     get_discrete_matrices,
     create_microgrid_dataloaders,
     DatasetMetadata
