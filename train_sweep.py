@@ -394,19 +394,6 @@ batched_reg_runner = nnx.vmap(
 )
 
 
-import wandb
-
-# === Get secret from Colab userdata ===
-from google.colab import userdata
-
-try:
-    wandb_api = userdata.get('WANDB_API_KEY')   # Recommended secret name
-except Exception as e:
-    print("Error retrieving secret. Make sure you added WANDB_API_KEY in Colab secrets.")
-    raise e
-
-# Login to Weights & Biases
-wandb.login(key=wandb_api)
 
 
 # =========================================================================
