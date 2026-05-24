@@ -9,9 +9,12 @@ import itertools
 import math
 import random
 from pathlib import Path
+from typing import Callable, TypeVar
+
+T = TypeVar("T")
 
 
-def parse_csv_numbers(raw: str, cast):
+def parse_csv_numbers(raw: str, cast: Callable[[str], T]) -> list[T]:
     return [cast(item.strip()) for item in raw.split(",") if item.strip()]
 
 
@@ -31,7 +34,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-sizes", default="32,64,128")
     parser.add_argument("--epochs", default="5,10")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--output", default="sweep_results.csv")
+    parser.add_argument("--output", default="results/sweep_results.csv")
     return parser
 
 

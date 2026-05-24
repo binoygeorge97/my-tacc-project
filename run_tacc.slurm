@@ -11,5 +11,7 @@ set -euo pipefail
 
 module load python3
 
-python3 -m pip install --user -r requirements.txt
+if grep -qEv '^\s*(#|$)' requirements.txt; then
+  python3 -m pip install --user -r requirements.txt
+fi
 python3 train_sweep.py --output results/sweep_results.csv
