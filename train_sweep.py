@@ -735,8 +735,16 @@ def visualize_system_plots(inputs, targets, preds, dataset_name="microgrid", n_p
     safe_title = custom_title.replace(" | ", "_").replace("=", "").replace(" ", "_")
     save_path = f"{safe_title}.png"
     plt.savefig(save_path, bbox_inches='tight', dpi=300)
+    
+    # --- NEW: Upload the image to W&B if a run is currently active ---
+    import wandb
+    if wandb.run is not None:
+        wandb.log({"Evaluation_Plots": wandb.Image(save_path)})
+    # -----------------------------------------------------------------
+    
     plt.close(fig)
-    print(f"[*] Saved evaluation plot to {save_path}")
+    print(f"[*] Saved evaluation plot to {save_path} and logged to W&B")
+
 
 def run_evaluation(model, Ad, Bd, d_model, n_layers, dataset_name="microgrid", custom_title=""):
     print(f"[*] Running Step-by-Step RNN Inference for: {custom_title}")
