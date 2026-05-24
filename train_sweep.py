@@ -700,28 +700,80 @@ def visualize_system_plots(inputs, targets, preds, dataset_name="microgrid", n_p
     meta = DatasetMetadata.get(dataset_name, {})
     dt = meta.get("dt", 0.01)
     
+    in_labels = meta.get("input_labels", [f"Input Ch {d}" for d in range(inputs.shape[-1])])
+    out_labels = meta.get("output_labels", [f"Output Ch {d}" for d in range(targets.shape[-1])])
+    time_arr = np.arange(inputs.shape[1]) * dt
+
     fig, axes = plt.subplots(n_plot, 2, figsize=(16, 4 * n_plot), squeeze=False)
     fig.suptitle(custom_title, fontsize=16, fontweight='bold')
 
     for i in range(n_plot):
-        # Your plotting logic here remains identical...
-        axes[i, 0].plot(inputs[i, :, 0]) # Abbreviated for space - keep your loop here!
-        axes[i, 1].plot(targets[i, :, 0]) 
+        ax_in, ax_out = axes[i, 0], axes[i, 1]
+        
+        # Plot Inputs
+        for d in range(min(inputs.shape[-1], max_channels)):
+            ax_in.plot(time_arr, inputs[i, :, d], alpha=0.7, label=in_labels[d] if d < len(in_labels) else f"In {d}")
+        ax_in.set_title(f"Sample {i}: Inputs")
+        ax_in.grid(True, alpha=0.3)
+        ax_in.legend(loc='upper right')
+
+        # Plot Outputs
+        total_mse = 0.0
+        for d in range(min(targets.shape[-1], max_channels)):
+            label_name = out_labels[d] if d < len(out_labels) else f"Out {d}"
+            ax_out.plot(time_arr, targets[i, :, d], '-', linewidth=2, alpha=0.5, label=f'True: {label_name}')
+            ax_out.plot(time_arr, preds[i, :, d], '--', linewidth=1.5, label=f'Pred: {label_name}')
+            total_mse += np.mean((targets[i, :, d] - preds[i, :, d])**2)
+            
+        ax_out.set_title(f"Sample {i}: Outputs (Avg MSE: {total_mse/targets.shape[-1]:.5f})")
+        ax_out.grid(True, alpha=0.3)
+        ax_out.legend(loc='upper right')
+
+    plt.tight_layout()
     
     # MODIFIED FOR TACC: Save to file instead of plt.show()
     safe_title = custom_title.replace(" | ", "_").replace("=", "").replace(" ", "_")
     save_path = f"{safe_title}.png"
     plt.savefig(save_path, bbox_inches='tight', dpi=300)
     plt.close(fig)
+    print(f"[*] Saved evaluation plot to {save_path}")
 
 def run_evaluation(model, Ad, Bd, d_model, n_layers, dataset_name="microgrid", custom_title=""):
-    _, testloader, _, _ = create_microgrid_dataloaders(Ad, Bd, bsz=32, L=100)
-    inputs_u, targets_y = jnp.array(testloader[0][0]), jnp.array(testloader[0][1])
+    print(f"[*] Running Step-by-Step RNN Inference for: {custom_title}")
 
-    # Keep your exact step_by_step_inference scan setup here...
-    # preds_y = step_by_step_inference(model, inputs_u)
-    
-    # visualize_system_plots(inputs_u, targets_y, preds_y, custom_title=custom_title)
+    l_max, bsz = 100, 32
+    _, testloader, _, _ = create_microgrid_dataloaders(Ad, Bd, bsz=bsz, L=l_max)
+
+    inputs_u, targets_y = jnp.array(testloader[0][0]), jnp.array(testloader[0][1])
+    H_dim, N_dim = d_model, 64 
+
+    @nnx.jit
+    def step_by_step_inference(model, inputs):
+        B_batch, L, D = inputs.shape
+        inputs_t = jnp.transpose(inputs, (1, 0, 2))
+        init_states = [jnp.zeros((B_batch, H_dim, N_dim), dtype=jnp.complex64) for _ in range(n_layers)]
+
+        def scan_step(carry, x_t):
+            model_carry, current_states_batch = carry
+            def single_sample_step(m, x, s):
+                pred, new_s = m(x, states=s, training=False)
+                return pred, new_s
+
+            runner = nnx.vmap(
+                single_sample_step,
+                in_axes=(nnx.StateAxes({nnx.Param: None}), 0, 0),
+                out_axes=(0, 0)
+            )
+            pred_batch, new_states_batch = runner(model_carry, x_t, current_states_batch)
+            return (model_carry, new_states_batch), pred_batch
+
+        initial_carry = (model, init_states)
+        _, preds_t = nnx.scan(scan_step, in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))(initial_carry, inputs_t)
+        return jnp.transpose(preds_t, (1, 0, 2))
+
+    preds_y = step_by_step_inference(model, inputs_u)
+    visualize_system_plots(inputs_u, targets_y, preds_y, n_plot=3, dataset_name=dataset_name, custom_title=custom_title)
+
 
 # =========================================================================
 # 5. MAIN EXECUTION
@@ -729,34 +781,56 @@ def run_evaluation(model, Ad, Bd, d_model, n_layers, dataset_name="microgrid", c
 if __name__ == "__main__":
     import os
     
-    # Grab the API key from the Slurm environment
+    # 1. Connect to Ray and pass W&B key to workers
     wandb_key = os.environ.get("WANDB_API_KEY")
     ray_env = {"env_vars": {"WANDB_API_KEY": wandb_key}} if wandb_key else {}
 
-    # Tell Ray to pass this environment variable to all A100/H100 workers
     if "RAY_ADDRESS" in os.environ:
         ray.init(address="auto", runtime_env=ray_env)
         print("[*] Connected to Slurm Ray Cluster")
     else:
         ray.init(ignore_reinit_error=True, runtime_env=ray_env)
 
+    # 2. Execute the Sweep
     print("[*] Launching Ray Sweep...")
     experiments = get_sweep_configs()
     futures = [train_single_model.remote(mat, hp) for mat, hp in experiments]
     results = ray.get(futures)
     
+    # 3. Save Sweep Results
     df = pd.DataFrame(results)
-    df.to_csv("sweep_results.csv", index=False)
-    print("\n✅ Sweep Complete!")
+    csv_path = "sweep_results.csv"
+    df.to_csv(csv_path, index=False)
+    print(f"\n✅ Sweep Complete! Results saved to {csv_path}")
     
-    # Evaluation block (Identical to your script)
+    # 4. Immediately Evaluate Top Models
     top_models = df.sort_values(by="mse", ascending=True).head(7)
+    print("\n🏆 Top Models from the Sweep:")
+    print(top_models[['matrix_id', 'mse', 'path']])
+
     matrix_lookup = {exp[0]["matrix_id"]: exp[0]["A_continuous"] for exp in experiments}
-    
+    meta = DatasetMetadata.get("microgrid", {})
+    d_in = len(meta.get("input_labels", [1]))
+    d_out = len(meta.get("output_labels", [1]))
+
     for index, row in top_models.iterrows():
         mat_id = int(row['matrix_id'])
-        Ad, Bd = get_discrete_matrices(matrix_lookup[mat_id])
-        model = load_model_regression(row['path'], d_input_arg=9, d_output_arg=6)
+        ckpt_path = row['path']
+        print(f"\n=======================================================")
+        print(f"[*] Evaluating Winner {index+1}: Matrix {mat_id}")
+
+        if not os.path.exists(ckpt_path):
+            print(f"❌ Checkpoint not found at {ckpt_path}")
+            continue
+
+        A_continuous = matrix_lookup[mat_id]
+        Ad, Bd = get_discrete_matrices(A_continuous)
+        model = load_model_regression(ckpt_path, d_input_arg=d_in, d_output_arg=d_out)
         
         plot_title = f"Rank {index+1} | Matrix {mat_id} | d_model={model.d_model} | Test MSE: {row['mse']:.6f}"
-        run_evaluation(model, Ad, Bd, model.d_model, model.n_layers, custom_title=plot_title)
+        
+        run_evaluation(
+            model=model, Ad=Ad, Bd=Bd, 
+            d_model=model.d_model, n_layers=model.n_layers, 
+            dataset_name="microgrid", custom_title=plot_title
+        )
