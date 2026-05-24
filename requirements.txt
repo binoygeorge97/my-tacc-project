@@ -1,9 +1,12 @@
-flax
-optax
+# Exact match to Colab
+jax[cuda12]==0.7.2
+flax==0.11.2
+optax==0.2.8
+numpy==2.0.2
+pandas==2.2.2
+wandb==0.26.1
+
+# Other required packages
 ray
-pandas
-numpy
 matplotlib
 tqdm
-# TACC requires the specific CUDA 12 JAX build
-jax[cuda12]
