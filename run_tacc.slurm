@@ -9,8 +9,9 @@
 #SBATCH -A IRI26016                 # <--- REPLACE WITH YOUR TACC PROJECT CODE
 
 # 1. Load Modules
-module load python3/3.9.2
-module load cuda/12.0
+module load gcc/12.2.0  # Good practice to load a newer compiler on TACC
+module load python3/3.12
+module load cuda/12.8
 
 # Add your W&B API Key here!
 export WANDB_API_KEY="5b9121798100cc1b68dd94823ced58122a9de2c0"
