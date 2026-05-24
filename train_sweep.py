@@ -686,8 +686,22 @@ def train_single_model(matrix_dict, hp_dict):
         "microgrid", "s4", 42, model_cfg, train_cfg, Ad, Bd, unique_save_path
     )
     
-    # 3. Log the final results to W&B and close the run
     wandb.log({"final_test_mse": final_mse})
+
+    # --- NEW: Run Evaluation INSIDE the worker before W&B closes ---
+    plot_title = f"Matrix {matrix_id} | d_model={model_cfg['d_model']} | Test MSE: {final_mse:.6f}"
+    run_evaluation(
+        model=trained_model, 
+        Ad=Ad, 
+        Bd=Bd, 
+        d_model=model_cfg['d_model'], 
+        n_layers=model_cfg['n_layers'], 
+        dataset_name="microgrid", 
+        custom_title=plot_title
+    )
+    # ---------------------------------------------------------------
+
+    # 3. Close the run
     wandb.finish()
     
     return {"matrix_id": matrix_id, "mse": final_mse, "path": unique_save_path}
@@ -821,24 +835,24 @@ if __name__ == "__main__":
     d_in = len(meta.get("input_labels", [1]))
     d_out = len(meta.get("output_labels", [1]))
 
-    for index, row in top_models.iterrows():
-        mat_id = int(row['matrix_id'])
-        ckpt_path = row['path']
-        print(f"\n=======================================================")
-        print(f"[*] Evaluating Winner {index+1}: Matrix {mat_id}")
+    # for index, row in top_models.iterrows():
+    #     mat_id = int(row['matrix_id'])
+    #     ckpt_path = row['path']
+    #     print(f"\n=======================================================")
+    #     print(f"[*] Evaluating Winner {index+1}: Matrix {mat_id}")
 
-        if not os.path.exists(ckpt_path):
-            print(f"❌ Checkpoint not found at {ckpt_path}")
-            continue
+    #     if not os.path.exists(ckpt_path):
+    #         print(f"❌ Checkpoint not found at {ckpt_path}")
+    #         continue
 
-        A_continuous = matrix_lookup[mat_id]
-        Ad, Bd = get_discrete_matrices(A_continuous)
-        model = load_model_regression(ckpt_path, d_input_arg=d_in, d_output_arg=d_out)
+    #     A_continuous = matrix_lookup[mat_id]
+    #     Ad, Bd = get_discrete_matrices(A_continuous)
+    #     model = load_model_regression(ckpt_path, d_input_arg=d_in, d_output_arg=d_out)
         
-        plot_title = f"Rank {index+1} | Matrix {mat_id} | d_model={model.d_model} | Test MSE: {row['mse']:.6f}"
+    #     plot_title = f"Rank {index+1} | Matrix {mat_id} | d_model={model.d_model} | Test MSE: {row['mse']:.6f}"
         
-        run_evaluation(
-            model=model, Ad=Ad, Bd=Bd, 
-            d_model=model.d_model, n_layers=model.n_layers, 
-            dataset_name="microgrid", custom_title=plot_title
-        )
+    #     run_evaluation(
+    #         model=model, Ad=Ad, Bd=Bd, 
+    #         d_model=model.d_model, n_layers=model.n_layers, 
+    #         dataset_name="microgrid", custom_title=plot_title
+    #     )
