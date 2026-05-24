@@ -15,6 +15,12 @@ module load cuda/12.0
 # Add your W&B API Key here!
 export WANDB_API_KEY="5b9121798100cc1b68dd94823ced58122a9de2c0"
 
+
+# --- Email Notifications ---
+#SBATCH --mail-user=phdstudiescontrols@gmail.com
+#SBATCH --mail-type=BEGIN,END,FAIL 
+
+
 # 2. Setup Virtual Environment (Runs once if it doesn't exist)
 if [ ! -d "$WORK/nnx_env" ]; then
     echo "Creating virtual environment..."
