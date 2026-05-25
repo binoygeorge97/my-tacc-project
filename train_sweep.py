@@ -691,7 +691,13 @@ if __name__ == "__main__":
     
     # 1. Connect to Ray and pass W&B key to workers
     wandb_key = os.environ.get("WANDB_API_KEY")
-    ray_env = {"env_vars": {"WANDB_API_KEY": wandb_key}} if wandb_key else {}
+    #ray_env = {"env_vars": {"WANDB_API_KEY": wandb_key}} if wandb_key else {}
+    # --- CRITICAL FIX: Add working_dir ---
+    ray_env = {
+        "working_dir": ".",  # This tells Ray to copy data/ and model/ to all nodes
+        "env_vars": {"WANDB_API_KEY": wandb_key} if wandb_key else {}
+    }
+    # -------------------------------------
 
     if "RAY_ADDRESS" in os.environ:
         ray.init(address="auto", runtime_env=ray_env)
