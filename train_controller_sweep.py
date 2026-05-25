@@ -72,6 +72,11 @@ def save_controller(ctrl, max_u_val, filename):
 @ray.remote(num_gpus=0.15) # TACC Optimized Ratio
 def train_single_controller(matrix_id, A_continuous, s4_ckpt_path, max_u_val):
     import os
+
+    # --- FIX 2: Lustre DDoS Prevention ---
+    # Randomly delay startup between 0.1 and 5.0 seconds
+    time.sleep(random.uniform(0.1, 5.0)) 
+    # -------------------------------------
     
     # Isolate W&B to node RAM disk
     worker_wandb_dir = f"/tmp/wandb_{matrix_id}_{max_u_val}"
@@ -212,10 +217,17 @@ if __name__ == "__main__":
     ray.shutdown()
     wandb_key = os.environ.get("WANDB_API_KEY")
     
+    # --- FIX 1: Force JAX memory rules into the Ray worker payload ---
     ray_env = {
         "working_dir": ".", 
-        "env_vars": {"WANDB_API_KEY": wandb_key} if wandb_key else {}
+        "env_vars": {
+            "WANDB_API_KEY": wandb_key if wandb_key else "",
+            "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+            "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.10"
+        }
     }
+    # -----------------------------------------------------------------
+    
     if "RAY_ADDRESS" in os.environ:
         ray.init(address="auto", runtime_env=ray_env)
         print("[*] Connected to Slurm Ray Cluster")
