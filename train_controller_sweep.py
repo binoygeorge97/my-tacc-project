@@ -98,7 +98,7 @@ def train_single_controller(matrix_id, A_continuous, s4_ckpt_path, max_u_val):
 
     L_seq, B_size = 100, 32
 
-    for i in range(400):
+    for i in range(40):
         y_targets = jnp.zeros((B_size, L_seq, d_y))
         y_initial = jax.random.uniform(jax.random.PRNGKey(i), (B_size, d_y), minval=-1.0, maxval=1.0)
         loss = train_ctrl_step(ctrl, env_model, optimizer, y_targets, y_initial)
