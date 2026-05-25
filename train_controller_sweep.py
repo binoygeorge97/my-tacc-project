@@ -66,9 +66,6 @@ def save_controller(ctrl, max_u_val, filename):
 
 @ray.remote(num_gpus=0.15) # TACC Optimized Ratio
 def train_single_controller(matrix_id, A_continuous, s4_ckpt_path, max_u_val):
-    os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.10"
-    
-    import os
     import jax
     import jax.numpy as jnp
     import optax
