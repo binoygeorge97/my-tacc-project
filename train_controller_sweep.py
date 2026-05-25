@@ -204,8 +204,7 @@ def train_single_controller(matrix_id, A_continuous, s4_ckpt_path, max_u_val):
     })
     
     run.finish() 
-    
-    import time
+
     time.sleep(2) 
 
     save_path = f"checkpoints/controllers/gru_mat{matrix_id}_maxu{max_u_val}.msgpack"
