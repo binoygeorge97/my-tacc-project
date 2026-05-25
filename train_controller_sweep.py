@@ -73,13 +73,12 @@ def save_controller(ctrl, max_u_val, filename):
 def train_single_controller(matrix_id, A_continuous, s4_ckpt_path, max_u_val):
     import os
     
-    # --- 2. LUSTRE SQLITE DATABASE FIX (Isolate W&B to node RAM disk) ---
+    # Isolate W&B to node RAM disk
     worker_wandb_dir = f"/tmp/wandb_{matrix_id}_{max_u_val}"
     os.makedirs(worker_wandb_dir, exist_ok=True)
     os.environ["WANDB_DIR"] = worker_wandb_dir
     os.environ["WANDB_CACHE_DIR"] = worker_wandb_dir
     os.environ["WANDB_CONFIG_DIR"] = worker_wandb_dir
-    # --------------------------------------------------------------------
 
     import jax
     import jax.numpy as jnp
@@ -87,6 +86,9 @@ def train_single_controller(matrix_id, A_continuous, s4_ckpt_path, max_u_val):
     from flax import nnx
     import wandb 
     import numpy as np
+    
+    import matplotlib
+    matplotlib.use('Agg')
     import matplotlib.pyplot as plt
 
     from train_controller_sweep import train_ctrl_step 
@@ -116,17 +118,17 @@ def train_single_controller(matrix_id, A_continuous, s4_ckpt_path, max_u_val):
 
     L_seq, B_size = 100, 32
 
-    # --- GPU Accelerated Training ---
+    # --- 1. GPU Accelerated Training ---
     for i in range(400):
         y_targets = jnp.zeros((B_size, L_seq, d_y))
         y_initial = jax.random.uniform(jax.random.PRNGKey(i), (B_size, d_y), minval=-1.0, maxval=1.0)
         loss = train_ctrl_step(ctrl, env_model, optimizer, y_targets, y_initial)
         
-        # --- 3. JAX SCALAR CAST FIX (Ensures JSON serialization works) ---
-        wandb.log({"train/mse_loss": loss.item(), "epoch": i})
-        # -----------------------------------------------------------------
+        # FIX 1 & 3: Use run.log and safely strip JAX arrays
+        safe_loss = float(np.array(loss))
+        run.log({"train/mse_loss": safe_loss, "epoch": i})
 
-    # --- GPU Accelerated Testing ---
+    # --- 2. GPU Accelerated Testing ---
     def jax_simulate_real_step(x_prev, u_curr):
         return jnp.dot(Ad, x_prev) + jnp.dot(Bd, u_curr)
 
@@ -182,20 +184,22 @@ def train_single_controller(matrix_id, A_continuous, s4_ckpt_path, max_u_val):
     ax2.legend(loc='right')
 
     plt.tight_layout()
-    save_plot_path = f"eval_mat{matrix_id}_maxu{max_u_val}.png"
+    
+    # FIX 2: Save the image directly to the RAM disk, avoiding Lustre
+    save_plot_path = os.path.join(worker_wandb_dir, f"eval_mat{matrix_id}_maxu{max_u_val}.png")
     plt.savefig(save_plot_path, bbox_inches='tight', dpi=300)
     plt.close(fig)
 
-    wandb.log({
+    # FIX 1: Bind logging to the run object explicitly
+    run.log({
         "test/sim_to_real_mse": final_test_mse,
         "evaluation/rollout_plot": wandb.Image(save_plot_path)
     })
     
     run.finish() 
     
-    # --- 4. NETWORK SOCKET BUFFER FIX ---
+    import time
     time.sleep(2) 
-    # ------------------------------------
 
     save_path = f"checkpoints/controllers/gru_mat{matrix_id}_maxu{max_u_val}.msgpack"
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
