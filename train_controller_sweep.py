@@ -132,8 +132,49 @@ def train_single_controller(matrix_id, A_continuous, s4_ckpt_path, max_u_val):
     y_actual_hist = np.array(fast_test_loop(ctrl, x_real_init, y_target_test))
     final_test_mse = float(np.mean(y_actual_hist[-50:] ** 2))
 
-    wandb.log({"test/sim_to_real_mse": final_test_mse})
-    run.finish() 
+    # --- FIX: Generate Plot Directly Inside Active Worker Thread ---
+    t_test = np.linspace(0, test_L * 0.01, test_L)
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+    fig.suptitle(f"Matrix {matrix_id} | max_u = {max_u_val} | Final Test MSE: {final_test_mse:.2f}", fontsize=16, fontweight='bold')
+
+    for y_dim in range(d_y): 
+        ax1.plot(t_test, y_actual_hist[:, y_dim], alpha=0.8)
+    ax1.plot(t_test, y_target_test[:, 0], 'k--', linewidth=2)
+    ax1.set_title("System States over Time")
+    ax1.grid(True, alpha=0.3)
+
+    # Re-run control loop briefly to extract historical command actions for plotting
+    u_hist = []
+    c_carry = ctrl.initialize_carry(batch_size=1)
+    y_curr_p = x_real_init.flatten()
+    for t in range(test_L):
+        u_cmd, c_carry = ctrl(y_curr_p, y_target_test[t], c_carry)
+        u_flat = np.array(u_cmd).flatten()
+        u_hist.append(u_flat)
+        x_real_next = jax_simulate_real_step(x_real_init, u_flat.reshape(d_u, 1)) # dummy step for plotting path
+        y_curr_p = np.array(x_real_next).flatten()
+    u_hist = np.array(u_hist)
+
+    for u_dim in range(d_u): 
+        ax2.plot(t_test, u_hist[:, u_dim], alpha=0.8)
+    ax2.axhline(max_u_val, color='red', linestyle=':', alpha=0.5)
+    ax2.axhline(-max_u_val, color='red', linestyle=':', alpha=0.5)
+    ax2.set_title("Controller Action")
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    save_plot_path = f"eval_mat{matrix_id}_maxu{max_u_val}.png"
+    plt.savefig(save_plot_path, bbox_inches='tight', dpi=300)
+    
+    # Send metrics and images sequentially through the active socket
+    wandb.log({
+        "test/sim_to_real_mse": final_test_mse,
+        "evaluation/rollout_plot": wandb.Image(save_plot_path)
+    })
+    plt.close(fig)
+    # -----------------------------------------------------------------
+
+    run.finish() # Closes securely
 
     save_path = f"checkpoints/controllers/gru_mat{matrix_id}_maxu{max_u_val}.msgpack"
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -152,72 +193,72 @@ def load_gru_controller(ckpt_path, d_y, d_u, max_action):
     nnx.update(ctrl, restored['model_state'])
     return ctrl
 
-def plot_gru_results():
-    csv_path = "gru_sweep_results.csv"
-    df = pd.read_csv(csv_path)
-    experiments = get_sweep_configs()
-    matrix_lookup = {str(exp[0]["matrix_id"]): exp[0]["A_continuous"] for exp in experiments}
+# def plot_gru_results():
+#     csv_path = "gru_sweep_results.csv"
+#     df = pd.read_csv(csv_path)
+#     experiments = get_sweep_configs()
+#     matrix_lookup = {str(exp[0]["matrix_id"]): exp[0]["A_continuous"] for exp in experiments}
 
-    d_x, d_u, d_y, test_L, dt = 6, 3, 6, 150, 0.01
-    t_test = np.linspace(0, test_L * dt, test_L)
+#     d_x, d_u, d_y, test_L, dt = 6, 3, 6, 150, 0.01
+#     t_test = np.linspace(0, test_L * dt, test_L)
 
-    for index, row in df.iterrows():
-        mat_id = str(row['matrix_id'])
-        max_u = float(row['max_u'])
-        ckpt_path = row['ctrl_path']
-        mse = float(row['sim_to_real_mse'])
+#     for index, row in df.iterrows():
+#         mat_id = str(row['matrix_id'])
+#         max_u = float(row['max_u'])
+#         ckpt_path = row['ctrl_path']
+#         mse = float(row['sim_to_real_mse'])
 
-        run = wandb.init(
-            project="tacc-microgrid-s4-sweep",
-            group="gru_saturation_sweep",
-            job_type="evaluation", 
-            name=f"eval_mat{mat_id}_maxu{max_u}",
-            config={"matrix_id": mat_id, "max_u": max_u, "test_mse": mse},
-            reinit=True
-        )
+#         run = wandb.init(
+#             project="tacc-microgrid-s4-sweep",
+#             group="gru_saturation_sweep",
+#             job_type="evaluation", 
+#             name=f"eval_mat{mat_id}_maxu{max_u}",
+#             config={"matrix_id": mat_id, "max_u": max_u, "test_mse": mse},
+#             reinit=True
+#         )
 
-        Ad, Bd = get_discrete_matrices(matrix_lookup[mat_id])
-        ctrl = load_gru_controller(ckpt_path, d_y, d_u, max_u)
-        ctrl_carry = ctrl.initialize_carry(batch_size=1)
+#         Ad, Bd = get_discrete_matrices(matrix_lookup[mat_id])
+#         ctrl = load_gru_controller(ckpt_path, d_y, d_u, max_u)
+#         ctrl_carry = ctrl.initialize_carry(batch_size=1)
 
-        y_target_test = jnp.zeros((test_L, d_y))
-        x_real = jnp.array([[1.0], [-0.8], [0.5], [-0.5], [1.2], [-1.0]])
-        y_curr = x_real.flatten()
+#         y_target_test = jnp.zeros((test_L, d_y))
+#         x_real = jnp.array([[1.0], [-0.8], [0.5], [-0.5], [1.2], [-1.0]])
+#         y_curr = x_real.flatten()
 
-        y_actual_hist, u_hist = [], []
+#         y_actual_hist, u_hist = [], []
 
-        for t in range(test_L):
-            u_cmd, ctrl_carry = ctrl(y_curr, y_target_test[t], ctrl_carry)
-            u_flat = np.array(u_cmd).flatten()
-            u_hist.append(u_flat)
-            x_real = jnp.dot(Ad, x_real) + jnp.dot(Bd, u_flat.reshape(d_u, 1))
-            y_curr = np.array(x_real).flatten()
-            y_actual_hist.append(y_curr)
+#         for t in range(test_L):
+#             u_cmd, ctrl_carry = ctrl(y_curr, y_target_test[t], ctrl_carry)
+#             u_flat = np.array(u_cmd).flatten()
+#             u_hist.append(u_flat)
+#             x_real = jnp.dot(Ad, x_real) + jnp.dot(Bd, u_flat.reshape(d_u, 1))
+#             y_curr = np.array(x_real).flatten()
+#             y_actual_hist.append(y_curr)
 
-        y_actual_hist, u_hist = np.array(y_actual_hist), np.array(u_hist)
+#         y_actual_hist, u_hist = np.array(y_actual_hist), np.array(u_hist)
 
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
-        fig.suptitle(f"Matrix {mat_id} | max_u = {max_u} | Final Test MSE: {mse:.2f}", fontsize=16, fontweight='bold')
+#         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+#         fig.suptitle(f"Matrix {mat_id} | max_u = {max_u} | Final Test MSE: {mse:.2f}", fontsize=16, fontweight='bold')
 
-        for y_dim in range(d_y): ax1.plot(t_test, y_actual_hist[:, y_dim], alpha=0.8)
-        ax1.plot(t_test, y_target_test[:, 0], 'k--', linewidth=2)
-        ax1.set_title("System States over Time")
-        ax1.grid(True, alpha=0.3)
+#         for y_dim in range(d_y): ax1.plot(t_test, y_actual_hist[:, y_dim], alpha=0.8)
+#         ax1.plot(t_test, y_target_test[:, 0], 'k--', linewidth=2)
+#         ax1.set_title("System States over Time")
+#         ax1.grid(True, alpha=0.3)
 
-        for u_dim in range(d_u): ax2.plot(t_test, u_hist[:, u_dim], alpha=0.8)
-        ax2.axhline(max_u, color='red', linestyle=':', alpha=0.5)
-        ax2.axhline(-max_u, color='red', linestyle=':', alpha=0.5)
-        ax2.set_title("Controller Action")
-        ax2.grid(True, alpha=0.3)
+#         for u_dim in range(d_u): ax2.plot(t_test, u_hist[:, u_dim], alpha=0.8)
+#         ax2.axhline(max_u, color='red', linestyle=':', alpha=0.5)
+#         ax2.axhline(-max_u, color='red', linestyle=':', alpha=0.5)
+#         ax2.set_title("Controller Action")
+#         ax2.grid(True, alpha=0.3)
 
-        # --- TACC Headless Plotting Fix ---
-        save_plot_path = f"eval_mat{mat_id}_maxu{max_u}.png"
-        plt.tight_layout()
-        plt.savefig(save_plot_path, bbox_inches='tight', dpi=300)
+#         # --- TACC Headless Plotting Fix ---
+#         save_plot_path = f"eval_mat{mat_id}_maxu{max_u}.png"
+#         plt.tight_layout()
+#         plt.savefig(save_plot_path, bbox_inches='tight', dpi=300)
         
-        wandb.log({"evaluation/rollout_plot": wandb.Image(save_plot_path)})
-        plt.close(fig)
-        run.finish()
+#         wandb.log({"evaluation/rollout_plot": wandb.Image(save_plot_path)})
+#         plt.close(fig)
+#         run.finish()
 
 if __name__ == "__main__":
     ray.shutdown()
