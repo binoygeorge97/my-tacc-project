@@ -74,6 +74,9 @@ def train_single_controller(matrix_id, A_continuous, s4_ckpt_path, max_u_val):
     from flax import nnx
     import wandb 
 
+    # --- FIX: Bring the step compilation into the remote worker scope ---
+    from train_controller_sweep import train_ctrl_step
+
     run = wandb.init(
         project="tacc-microgrid-s4-sweep",
         group="gru_saturation_sweep",
