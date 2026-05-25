@@ -11,11 +11,16 @@ import jax.numpy as jnp
 from flax import nnx
 import optax
 import numpy as np
-import matplotlib.pyplot as plt
-from flax import serialization
+import time
 import ray
 import wandb
-import time
+from flax import serialization
+
+# --- 1. MATPLOTLIB HEADLESS FIX (Must happen before UI loads) ---
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+# ----------------------------------------------------------------
 
 # --- Local TACC Imports ---
 from model.controller import GRUController, Trained_System_Model
@@ -66,6 +71,16 @@ def save_controller(ctrl, max_u_val, filename):
 
 @ray.remote(num_gpus=0.15) # TACC Optimized Ratio
 def train_single_controller(matrix_id, A_continuous, s4_ckpt_path, max_u_val):
+    import os
+    
+    # --- 2. LUSTRE SQLITE DATABASE FIX (Isolate W&B to node RAM disk) ---
+    worker_wandb_dir = f"/tmp/wandb_{matrix_id}_{max_u_val}"
+    os.makedirs(worker_wandb_dir, exist_ok=True)
+    os.environ["WANDB_DIR"] = worker_wandb_dir
+    os.environ["WANDB_CACHE_DIR"] = worker_wandb_dir
+    os.environ["WANDB_CONFIG_DIR"] = worker_wandb_dir
+    # --------------------------------------------------------------------
+
     import jax
     import jax.numpy as jnp
     import optax
@@ -74,7 +89,6 @@ def train_single_controller(matrix_id, A_continuous, s4_ckpt_path, max_u_val):
     import numpy as np
     import matplotlib.pyplot as plt
 
-    # Import the training step function explicitly inside the worker scope
     from train_controller_sweep import train_ctrl_step 
     from model.controller import GRUController, Trained_System_Model
     from data.dataloader import get_discrete_matrices
@@ -102,16 +116,17 @@ def train_single_controller(matrix_id, A_continuous, s4_ckpt_path, max_u_val):
 
     L_seq, B_size = 100, 32
 
-    # --- 1. GPU Accelerated Training ---
+    # --- GPU Accelerated Training ---
     for i in range(400):
         y_targets = jnp.zeros((B_size, L_seq, d_y))
         y_initial = jax.random.uniform(jax.random.PRNGKey(i), (B_size, d_y), minval=-1.0, maxval=1.0)
         loss = train_ctrl_step(ctrl, env_model, optimizer, y_targets, y_initial)
         
-        # Log training metrics on every step
-        wandb.log({"train/mse_loss": float(loss), "epoch": i})
+        # --- 3. JAX SCALAR CAST FIX (Ensures JSON serialization works) ---
+        wandb.log({"train/mse_loss": loss.item(), "epoch": i})
+        # -----------------------------------------------------------------
 
-    # --- 2. GPU Accelerated Testing (Returns y AND u natively) ---
+    # --- GPU Accelerated Testing ---
     def jax_simulate_real_step(x_prev, u_curr):
         return jnp.dot(Ad, x_prev) + jnp.dot(Bd, u_curr)
 
@@ -124,15 +139,12 @@ def train_single_controller(matrix_id, A_continuous, s4_ckpt_path, max_u_val):
             y_curr, c_c, x_c = carry
             target_t_batch = target_t[jnp.newaxis, :]
             
-            # Compute action
             u_cmd, new_c_c = ctrl_model(y_curr, target_t_batch, c_c)
             u_mat = jnp.transpose(u_cmd)
             
-            # Step physics
             x_next = jax_simulate_real_step(x_c, u_mat)
             y_next = x_next.flatten()[jnp.newaxis, :]
             
-            # Return both state history and control action history
             return (y_next, new_c_c, x_next), (y_next, u_cmd)
 
         initial_carry = (y_initial, c_carry, x_initial_state)
@@ -143,14 +155,13 @@ def train_single_controller(matrix_id, A_continuous, s4_ckpt_path, max_u_val):
     y_target_test = jnp.zeros((test_L, d_y))
     x_real_init = jnp.array([[1.0], [-0.8], [0.5], [-0.5], [1.2], [-1.0]])
 
-    # Execute compiled test rollout
     y_actual_hist, u_hist = fast_test_loop(ctrl, x_real_init, y_target_test)
     
     y_actual_hist = np.array(y_actual_hist)
     u_hist = np.array(u_hist)
     final_test_mse = float(np.mean(y_actual_hist[-50:] ** 2))
 
-    # --- 3. Headless Plotting Fix ---
+    # --- Plotting ---
     t_test = np.linspace(0, test_L * 0.01, test_L)
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
     fig.suptitle(f"Matrix {matrix_id} | max_u = {max_u_val} | Final Test MSE: {final_test_mse:.2f}", fontsize=16, fontweight='bold')
@@ -175,16 +186,17 @@ def train_single_controller(matrix_id, A_continuous, s4_ckpt_path, max_u_val):
     plt.savefig(save_plot_path, bbox_inches='tight', dpi=300)
     plt.close(fig)
 
-    # --- 4. Synchronous Logging & Network Flush ---
     wandb.log({
         "test/sim_to_real_mse": final_test_mse,
         "evaluation/rollout_plot": wandb.Image(save_plot_path)
     })
     
-    # Force the worker node to finish processing telemetry packets before closing connection
     run.finish() 
+    
+    # --- 4. NETWORK SOCKET BUFFER FIX ---
+    time.sleep(2) 
+    # ------------------------------------
 
-    # Save checkpoint array
     save_path = f"checkpoints/controllers/gru_mat{matrix_id}_maxu{max_u_val}.msgpack"
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     save_controller(ctrl, max_u_val, save_path)
@@ -192,88 +204,10 @@ def train_single_controller(matrix_id, A_continuous, s4_ckpt_path, max_u_val):
     return {"matrix_id": matrix_id, "max_u": max_u_val, "sim_to_real_mse": final_test_mse, "ctrl_path": save_path}
 
 
-def load_gru_controller(ckpt_path, d_y, d_u, max_action):
-    with open(ckpt_path, 'rb') as f:
-        byte_data = f.read()
-    ctrl = GRUController(d_y=d_y, d_u=d_u, max_action=max_action, rngs=nnx.Rngs(0))
-    current_state_dict = nnx.state(ctrl, nnx.Param).to_pure_dict()
-    template = {'model_state': current_state_dict, 'config': {'max_u': max_action}}
-    restored = serialization.from_bytes(template, byte_data)
-    nnx.update(ctrl, restored['model_state'])
-    return ctrl
-
-# def plot_gru_results():
-#     csv_path = "gru_sweep_results.csv"
-#     df = pd.read_csv(csv_path)
-#     experiments = get_sweep_configs()
-#     matrix_lookup = {str(exp[0]["matrix_id"]): exp[0]["A_continuous"] for exp in experiments}
-
-#     d_x, d_u, d_y, test_L, dt = 6, 3, 6, 150, 0.01
-#     t_test = np.linspace(0, test_L * dt, test_L)
-
-#     for index, row in df.iterrows():
-#         mat_id = str(row['matrix_id'])
-#         max_u = float(row['max_u'])
-#         ckpt_path = row['ctrl_path']
-#         mse = float(row['sim_to_real_mse'])
-
-#         run = wandb.init(
-#             project="tacc-microgrid-s4-sweep",
-#             group="gru_saturation_sweep",
-#             job_type="evaluation", 
-#             name=f"eval_mat{mat_id}_maxu{max_u}",
-#             config={"matrix_id": mat_id, "max_u": max_u, "test_mse": mse},
-#             reinit=True
-#         )
-
-#         Ad, Bd = get_discrete_matrices(matrix_lookup[mat_id])
-#         ctrl = load_gru_controller(ckpt_path, d_y, d_u, max_u)
-#         ctrl_carry = ctrl.initialize_carry(batch_size=1)
-
-#         y_target_test = jnp.zeros((test_L, d_y))
-#         x_real = jnp.array([[1.0], [-0.8], [0.5], [-0.5], [1.2], [-1.0]])
-#         y_curr = x_real.flatten()
-
-#         y_actual_hist, u_hist = [], []
-
-#         for t in range(test_L):
-#             u_cmd, ctrl_carry = ctrl(y_curr, y_target_test[t], ctrl_carry)
-#             u_flat = np.array(u_cmd).flatten()
-#             u_hist.append(u_flat)
-#             x_real = jnp.dot(Ad, x_real) + jnp.dot(Bd, u_flat.reshape(d_u, 1))
-#             y_curr = np.array(x_real).flatten()
-#             y_actual_hist.append(y_curr)
-
-#         y_actual_hist, u_hist = np.array(y_actual_hist), np.array(u_hist)
-
-#         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
-#         fig.suptitle(f"Matrix {mat_id} | max_u = {max_u} | Final Test MSE: {mse:.2f}", fontsize=16, fontweight='bold')
-
-#         for y_dim in range(d_y): ax1.plot(t_test, y_actual_hist[:, y_dim], alpha=0.8)
-#         ax1.plot(t_test, y_target_test[:, 0], 'k--', linewidth=2)
-#         ax1.set_title("System States over Time")
-#         ax1.grid(True, alpha=0.3)
-
-#         for u_dim in range(d_u): ax2.plot(t_test, u_hist[:, u_dim], alpha=0.8)
-#         ax2.axhline(max_u, color='red', linestyle=':', alpha=0.5)
-#         ax2.axhline(-max_u, color='red', linestyle=':', alpha=0.5)
-#         ax2.set_title("Controller Action")
-#         ax2.grid(True, alpha=0.3)
-
-#         # --- TACC Headless Plotting Fix ---
-#         save_plot_path = f"eval_mat{mat_id}_maxu{max_u}.png"
-#         plt.tight_layout()
-#         plt.savefig(save_plot_path, bbox_inches='tight', dpi=300)
-        
-#         wandb.log({"evaluation/rollout_plot": wandb.Image(save_plot_path)})
-#         plt.close(fig)
-#         run.finish()
-
 if __name__ == "__main__":
     ray.shutdown()
     wandb_key = os.environ.get("WANDB_API_KEY")
     
-    # --- TACC Slurm Ray Cluster Fix ---
     ray_env = {
         "working_dir": ".", 
         "env_vars": {"WANDB_API_KEY": wandb_key} if wandb_key else {}
@@ -283,7 +217,6 @@ if __name__ == "__main__":
         print("[*] Connected to Slurm Ray Cluster")
     else:
         ray.init(ignore_reinit_error=True, runtime_env=ray_env)
-    # ----------------------------------
 
     print("\n[*] Initializing Stage 2: GRU Controller Sweep...")
     df_s4 = pd.read_csv("sweep_results.csv")
@@ -307,4 +240,3 @@ if __name__ == "__main__":
     df_ctrl.to_csv("gru_sweep_results.csv", index=False)
 
     print("\n✅ GRU Sweep Complete!")
-    #plot_gru_results()
