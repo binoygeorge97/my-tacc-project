@@ -68,14 +68,21 @@ def save_controller(ctrl, max_u_val, filename):
 def train_single_controller(matrix_id, A_continuous, s4_ckpt_path, max_u_val):
     os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.10"
     
+    import os
     import jax
     import jax.numpy as jnp
     import optax
     from flax import nnx
     import wandb 
+    import numpy as np
+    import matplotlib.pyplot as plt
 
-    # --- FIX: Bring the step compilation into the remote worker scope ---
-    from train_controller_sweep import train_ctrl_step
+    # Import the training step function explicitly inside the worker scope
+    from train_controller_sweep import train_ctrl_step 
+    from model.controller import GRUController, Trained_System_Model
+    from data.dataloader import get_discrete_matrices
+
+    print(f"[*] Started Controller Training: Matrix {matrix_id} | max_u: {max_u_val}")
 
     run = wandb.init(
         project="tacc-microgrid-s4-sweep",
@@ -98,12 +105,16 @@ def train_single_controller(matrix_id, A_continuous, s4_ckpt_path, max_u_val):
 
     L_seq, B_size = 100, 32
 
-    for i in range(40):
+    # --- 1. GPU Accelerated Training ---
+    for i in range(400):
         y_targets = jnp.zeros((B_size, L_seq, d_y))
         y_initial = jax.random.uniform(jax.random.PRNGKey(i), (B_size, d_y), minval=-1.0, maxval=1.0)
         loss = train_ctrl_step(ctrl, env_model, optimizer, y_targets, y_initial)
+        
+        # Log training metrics on every step
         wandb.log({"train/mse_loss": float(loss), "epoch": i})
 
+    # --- 2. GPU Accelerated Testing (Returns y AND u natively) ---
     def jax_simulate_real_step(x_prev, u_curr):
         return jnp.dot(Ad, x_prev) + jnp.dot(Bd, u_curr)
 
@@ -115,67 +126,68 @@ def train_single_controller(matrix_id, A_continuous, s4_ckpt_path, max_u_val):
         def test_scan(carry, target_t):
             y_curr, c_c, x_c = carry
             target_t_batch = target_t[jnp.newaxis, :]
+            
+            # Compute action
             u_cmd, new_c_c = ctrl_model(y_curr, target_t_batch, c_c)
             u_mat = jnp.transpose(u_cmd)
+            
+            # Step physics
             x_next = jax_simulate_real_step(x_c, u_mat)
             y_next = x_next.flatten()[jnp.newaxis, :]
-            return (y_next, new_c_c, x_next), y_next
+            
+            # Return both state history and control action history
+            return (y_next, new_c_c, x_next), (y_next, u_cmd)
 
         initial_carry = (y_initial, c_carry, x_initial_state)
-        _, y_history = jax.lax.scan(test_scan, initial_carry, test_targets)
-        return jnp.squeeze(y_history, axis=1)
+        _, (y_history, u_history) = jax.lax.scan(test_scan, initial_carry, test_targets)
+        return jnp.squeeze(y_history, axis=1), jnp.squeeze(u_history, axis=1)
 
     test_L = 150
     y_target_test = jnp.zeros((test_L, d_y))
     x_real_init = jnp.array([[1.0], [-0.8], [0.5], [-0.5], [1.2], [-1.0]])
 
-    y_actual_hist = np.array(fast_test_loop(ctrl, x_real_init, y_target_test))
+    # Execute compiled test rollout
+    y_actual_hist, u_hist = fast_test_loop(ctrl, x_real_init, y_target_test)
+    
+    y_actual_hist = np.array(y_actual_hist)
+    u_hist = np.array(u_hist)
     final_test_mse = float(np.mean(y_actual_hist[-50:] ** 2))
 
-    # --- FIX: Generate Plot Directly Inside Active Worker Thread ---
+    # --- 3. Headless Plotting Fix ---
     t_test = np.linspace(0, test_L * 0.01, test_L)
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
     fig.suptitle(f"Matrix {matrix_id} | max_u = {max_u_val} | Final Test MSE: {final_test_mse:.2f}", fontsize=16, fontweight='bold')
 
     for y_dim in range(d_y): 
-        ax1.plot(t_test, y_actual_hist[:, y_dim], alpha=0.8)
-    ax1.plot(t_test, y_target_test[:, 0], 'k--', linewidth=2)
+        ax1.plot(t_test, y_actual_hist[:, y_dim], alpha=0.8, label=f"State $y_{y_dim}$")
+    ax1.plot(t_test, y_target_test[:, 0], 'k--', linewidth=2, label="Target")
     ax1.set_title("System States over Time")
     ax1.grid(True, alpha=0.3)
-
-    # Re-run control loop briefly to extract historical command actions for plotting
-    u_hist = []
-    c_carry = ctrl.initialize_carry(batch_size=1)
-    y_curr_p = x_real_init.flatten()
-    for t in range(test_L):
-        u_cmd, c_carry = ctrl(y_curr_p, y_target_test[t], c_carry)
-        u_flat = np.array(u_cmd).flatten()
-        u_hist.append(u_flat)
-        x_real_next = jax_simulate_real_step(x_real_init, u_flat.reshape(d_u, 1)) # dummy step for plotting path
-        y_curr_p = np.array(x_real_next).flatten()
-    u_hist = np.array(u_hist)
+    ax1.legend(loc='right')
 
     for u_dim in range(d_u): 
-        ax2.plot(t_test, u_hist[:, u_dim], alpha=0.8)
+        ax2.plot(t_test, u_hist[:, u_dim], alpha=0.8, label=f"Control $u_{u_dim}$")
     ax2.axhline(max_u_val, color='red', linestyle=':', alpha=0.5)
     ax2.axhline(-max_u_val, color='red', linestyle=':', alpha=0.5)
     ax2.set_title("Controller Action")
     ax2.grid(True, alpha=0.3)
+    ax2.legend(loc='right')
 
     plt.tight_layout()
     save_plot_path = f"eval_mat{matrix_id}_maxu{max_u_val}.png"
     plt.savefig(save_plot_path, bbox_inches='tight', dpi=300)
-    
-    # Send metrics and images sequentially through the active socket
+    plt.close(fig)
+
+    # --- 4. Synchronous Logging & Network Flush ---
     wandb.log({
         "test/sim_to_real_mse": final_test_mse,
         "evaluation/rollout_plot": wandb.Image(save_plot_path)
     })
-    plt.close(fig)
-    # -----------------------------------------------------------------
+    
+    # Force the worker node to finish processing telemetry packets before closing connection
+    run.finish() 
 
-    run.finish() # Closes securely
-
+    # Save checkpoint array
     save_path = f"checkpoints/controllers/gru_mat{matrix_id}_maxu{max_u_val}.msgpack"
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     save_controller(ctrl, max_u_val, save_path)
