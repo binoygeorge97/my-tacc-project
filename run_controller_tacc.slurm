@@ -25,6 +25,17 @@ conda activate nnx_env
 NV_BASE=$WORK/miniconda3/envs/nnx_env/lib/python3.12/site-packages/nvidia
 export LD_LIBRARY_PATH=$NV_BASE/cusparse/lib:$NV_BASE/cublas/lib:$NV_BASE/cudnn/lib:$NV_BASE/cuda_runtime/lib:$NV_BASE/cuda_nvrtc/lib:$LD_LIBRARY_PATH
 
+# --- NEW FIX: OS-Level Thread and Memory Clamps ---
+# These MUST be exported before Ray starts so the C++ daemon inherits them
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export XLA_FLAGS="--xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=1 inter_op_parallelism_threads=1"
+export XLA_PYTHON_CLIENT_PREALLOCATE="false"
+export XLA_PYTHON_CLIENT_MEM_FRACTION="0.10"
+export RAY_DEDUP_LOGS=0
+# --------------------------------------------------
+
 # 5. Identify the Ray Head Node
 nodes=$(scontrol show hostnames "$SLURM_JOB_NODELIST")
 nodes_array=($nodes)
