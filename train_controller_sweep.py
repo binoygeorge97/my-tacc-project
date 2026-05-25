@@ -241,7 +241,7 @@ if __name__ == "__main__":
     matrix_lookup = {str(exp[0]["matrix_id"]): exp[0]["A_continuous"] for exp in experiments}
 
     gru_jobs = []
-    unique_matrices = df_s4['matrix_id'].unique()
+    unique_matrices = df_s4['matrix_id'].unique()[:5]
 
     for mat_id in unique_matrices:
         mat_id = str(mat_id)
