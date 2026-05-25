@@ -1,44 +1,69 @@
-# train_controller_sweep.py
-
 import os
-# THESE MUST COME BEFORE ANY OTHER IMPORTS!
+import time
+import pandas as pd
+import numpy as np
+import ray
+import wandb
+
+# =========================================================================
+# 0. HPC ENVIRONMENT & JAX CONFIGURATION
+# =========================================================================
+# Prevent JAX from hoarding GPU memory on the head node and workers
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.10"
 
-import pandas as pd
 import jax
 import jax.numpy as jnp
-from flax import nnx
-import optax
-import numpy as np
-import time
-import ray
-import wandb
-from flax import serialization
 
-# --- 1. MATPLOTLIB HEADLESS FIX (Must happen before UI loads) ---
+# Force JAX to use A100 Tensor Cores for massive TF32 speedups
+jax.config.update("jax_default_matmul_precision", "tensorfloat32")
+
+import optax
+from flax import nnx, serialization
+
+# --- CRITICAL HPC FIX: Headless Matplotlib ---
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-# ----------------------------------------------------------------
 
-# --- Local TACC Imports ---
+# =========================================================================
+# 1. LOCAL MODULE IMPORTS
+# =========================================================================
 from model.controller import GRUController, Trained_System_Model
 from data.dataloader import get_discrete_matrices, get_sweep_configs
+
+
+# =========================================================================
+# 2. CORE TRAINING LOGIC
+# =========================================================================
+def save_controller(ctrl, max_u_val, filename):
+    ctrl_state = nnx.state(ctrl, nnx.Param).to_pure_dict()
+    checkpoint_data = {
+        'model_state': ctrl_state,
+        'config': {'max_u': max_u_val}
+    }
+    byte_data = serialization.to_bytes(checkpoint_data)
+    with open(filename, 'wb') as f:
+        f.write(byte_data)
 
 @nnx.jit
 def train_ctrl_step(ctrl, env_model, optimizer, y_targets, y_initial):
     batch_size = y_targets.shape[0]
+
     initial_s4_carry = env_model.initialize_carry(batch_size=batch_size)
     initial_ctrl_carry = ctrl.initialize_carry(batch_size)
 
+    # Strip the NNX state from the graph BEFORE entering trace boundaries
     env_graph, env_params = nnx.split(env_model, nnx.Param)
 
     def loss_fn(current_ctrl):
         def scan_step(carry, target_t_batch):
             y_curr, s4_c, ctrl_c = carry
+
+            # 1. Controller Step
             u_cmd, new_ctrl_c = current_ctrl(y_curr, target_t_batch, ctrl_c)
 
+            # 2. Pure JAX Vmap for the Environment Surrogate
             def pure_env_step(p, u, y, c):
                 m = nnx.merge(env_graph, p)
                 return m(u, y, c)
@@ -51,10 +76,12 @@ def train_ctrl_step(ctrl, env_model, optimizer, y_targets, y_initial):
 
             y_next = jnp.real(y_next)
             step_loss = jnp.mean((y_next - target_t_batch) ** 2)
+
             return (y_next, new_s4_c, new_ctrl_c), step_loss
 
         initial_carry = (y_initial, initial_s4_carry, initial_ctrl_carry)
         targets_seq = jnp.transpose(y_targets, (1, 0, 2))
+
         _, step_losses = jax.lax.scan(scan_step, initial_carry, targets_seq)
         return jnp.mean(step_losses)
 
@@ -62,56 +89,35 @@ def train_ctrl_step(ctrl, env_model, optimizer, y_targets, y_initial):
     optimizer.update(ctrl, grad)
     return loss
 
-def save_controller(ctrl, max_u_val, filename):
-    ctrl_state = nnx.state(ctrl, nnx.Param).to_pure_dict()
-    checkpoint_data = {'model_state': ctrl_state, 'config': {'max_u': max_u_val}}
-    byte_data = serialization.to_bytes(checkpoint_data)
-    with open(filename, 'wb') as f:
-        f.write(byte_data)
 
-@ray.remote(num_gpus=0.15) # TACC Optimized Ratio
+# =========================================================================
+# 3. RAY WORKER (DISTRIBUTED TRAINING & EVAL)
+# =========================================================================
+@ray.remote(num_gpus=0.1)
 def train_single_controller(matrix_id, A_continuous, s4_ckpt_path, max_u_val):
-    import os
-    import time
-    import random
-
-    # --- FIX 2: Lustre DDoS Prevention ---
-    # Randomly delay startup between 0.1 and 5.0 seconds
-    time.sleep(random.uniform(0.1, 5.0)) 
-    # -------------------------------------
-    
-    # Isolate W&B to node RAM disk
-    worker_wandb_dir = f"/tmp/wandb_{matrix_id}_{max_u_val}"
-    os.makedirs(worker_wandb_dir, exist_ok=True)
-    os.environ["WANDB_DIR"] = worker_wandb_dir
-    os.environ["WANDB_CACHE_DIR"] = worker_wandb_dir
-    os.environ["WANDB_CONFIG_DIR"] = worker_wandb_dir
-
-    import jax
-    import jax.numpy as jnp
-    import optax
-    from flax import nnx
-    import wandb 
-    import numpy as np
-    
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-
-    from train_controller_sweep import train_ctrl_step 
-    from model.controller import GRUController, Trained_System_Model
-    from data.dataloader import get_discrete_matrices
+    # Ensure memory limits apply to this specific worker process
+    os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.10"
+    jax.config.update("jax_default_matmul_precision", "tensorfloat32")
 
     print(f"[*] Started Controller Training: Matrix {matrix_id} | max_u: {max_u_val}")
 
+    # --- WANDB INIT ---
     run = wandb.init(
-        project="tacc-microgrid-s4-sweep",
-        group="gru_saturation_sweep",
+        project="tacc-dpc-sweep", 
+        group="gru_saturation_sweep", 
         name=f"mat{matrix_id}_maxu{max_u_val}",
-        config={"matrix_id": matrix_id, "max_action": max_u_val, "epochs": 40, "batch_size": 32, "seq_len": 100},
+        config={
+            "matrix_id": matrix_id,
+            "max_action": max_u_val,
+            "architecture": "GRU_128",
+            "epochs": 400,
+            "batch_size": 1024, # Scaled for A100
+            "seq_len": 300      # Scaled for A100
+        },
         reinit=True
     )
 
+    # 1. Setup Local Physics & Models
     Ad, Bd = get_discrete_matrices(A_continuous)
     d_x, d_u, d_y = 6, 3, 6
 
@@ -120,22 +126,22 @@ def train_single_controller(matrix_id, A_continuous, s4_ckpt_path, max_u_val):
         format_fn=lambda u, y: jnp.concatenate([y, u], axis=-1)
     )
 
-    ctrl = GRUController(d_y=d_y, d_u=d_u, max_action=max_u_val, rngs=nnx.Rngs(0))
+    rngs = nnx.Rngs(0)
+    ctrl = GRUController(d_y=d_y, d_u=d_u, max_action=max_u_val, rngs=rngs)
     optimizer = nnx.Optimizer(ctrl, optax.adam(1e-4), wrt=nnx.Param)
 
-    L_seq, B_size = 100, 32
+    # A100 Optimized Dimensions
+    L_seq, B_size = 300, 1024
 
-    # --- 1. GPU Accelerated Training ---
+    # --- 2. GPU Accelerated Training ---
     for i in range(400):
         y_targets = jnp.zeros((B_size, L_seq, d_y))
         y_initial = jax.random.uniform(jax.random.PRNGKey(i), (B_size, d_y), minval=-1.0, maxval=1.0)
-        loss = train_ctrl_step(ctrl, env_model, optimizer, y_targets, y_initial)
-        
-        # FIX 1 & 3: Use run.log and safely strip JAX arrays
-        safe_loss = float(np.array(loss))
-        run.log({"train/mse_loss": safe_loss, "epoch": i})
 
-    # --- 2. GPU Accelerated Testing ---
+        loss = train_ctrl_step(ctrl, env_model, optimizer, y_targets, y_initial)
+        wandb.log({"train/mse_loss": float(loss), "epoch": i})
+
+    # --- 3. GPU Accelerated Sim-to-Real Testing ---
     def jax_simulate_real_step(x_prev, u_curr):
         return jnp.dot(Ad, x_prev) + jnp.dot(Bd, u_curr)
 
@@ -147,113 +153,212 @@ def train_single_controller(matrix_id, A_continuous, s4_ckpt_path, max_u_val):
         def test_scan(carry, target_t):
             y_curr, c_c, x_c = carry
             target_t_batch = target_t[jnp.newaxis, :]
-            
+
             u_cmd, new_c_c = ctrl_model(y_curr, target_t_batch, c_c)
             u_mat = jnp.transpose(u_cmd)
-            
             x_next = jax_simulate_real_step(x_c, u_mat)
             y_next = x_next.flatten()[jnp.newaxis, :]
-            
-            return (y_next, new_c_c, x_next), (y_next, u_cmd)
+
+            return (y_next, new_c_c, x_next), y_next
 
         initial_carry = (y_initial, c_carry, x_initial_state)
-        _, (y_history, u_history) = jax.lax.scan(test_scan, initial_carry, test_targets)
-        return jnp.squeeze(y_history, axis=1), jnp.squeeze(u_history, axis=1)
+        _, y_history = jax.lax.scan(test_scan, initial_carry, test_targets)
+        return jnp.squeeze(y_history, axis=1)
 
     test_L = 150
     y_target_test = jnp.zeros((test_L, d_y))
     x_real_init = jnp.array([[1.0], [-0.8], [0.5], [-0.5], [1.2], [-1.0]])
 
-    y_actual_hist, u_hist = fast_test_loop(ctrl, x_real_init, y_target_test)
-    
+    y_actual_hist = fast_test_loop(ctrl, x_real_init, y_target_test)
+
+    # --- 4. Metrics & Saving ---
     y_actual_hist = np.array(y_actual_hist)
-    u_hist = np.array(u_hist)
     final_test_mse = float(np.mean(y_actual_hist[-50:] ** 2))
 
-    # --- Plotting ---
-    t_test = np.linspace(0, test_L * 0.01, test_L)
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
-    fig.suptitle(f"Matrix {matrix_id} | max_u = {max_u_val} | Final Test MSE: {final_test_mse:.2f}", fontsize=16, fontweight='bold')
-
-    for y_dim in range(d_y): 
-        ax1.plot(t_test, y_actual_hist[:, y_dim], alpha=0.8, label=f"State $y_{y_dim}$")
-    ax1.plot(t_test, y_target_test[:, 0], 'k--', linewidth=2, label="Target")
-    ax1.set_title("System States over Time")
-    ax1.grid(True, alpha=0.3)
-    ax1.legend(loc='right')
-
-    for u_dim in range(d_u): 
-        ax2.plot(t_test, u_hist[:, u_dim], alpha=0.8, label=f"Control $u_{u_dim}$")
-    ax2.axhline(max_u_val, color='red', linestyle=':', alpha=0.5)
-    ax2.axhline(-max_u_val, color='red', linestyle=':', alpha=0.5)
-    ax2.set_title("Controller Action")
-    ax2.grid(True, alpha=0.3)
-    ax2.legend(loc='right')
-
-    plt.tight_layout()
-    
-    # FIX 2: Save the image directly to the RAM disk, avoiding Lustre
-    save_plot_path = os.path.join(worker_wandb_dir, f"eval_mat{matrix_id}_maxu{max_u_val}.png")
-    plt.savefig(save_plot_path, bbox_inches='tight', dpi=300)
-    plt.close(fig)
-
-    # FIX 1: Bind logging to the run object explicitly
-    run.log({
-        "test/sim_to_real_mse": final_test_mse,
-        "evaluation/rollout_plot": wandb.Image(save_plot_path)
-    })
-    
-    run.finish() 
-
-    time.sleep(2) 
+    wandb.log({"test/sim_to_real_mse": final_test_mse})
+    run.finish() # Clean up WandB for this worker
 
     save_path = f"checkpoints/controllers/gru_mat{matrix_id}_maxu{max_u_val}.msgpack"
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     save_controller(ctrl, max_u_val, save_path)
 
-    return {"matrix_id": matrix_id, "max_u": max_u_val, "sim_to_real_mse": final_test_mse, "ctrl_path": save_path}
+    return {
+        "matrix_id": matrix_id,
+        "max_u": max_u_val,
+        "sim_to_real_mse": final_test_mse,
+        "ctrl_path": save_path
+    }
 
 
-if __name__ == "__main__":
+# =========================================================================
+# 4. HEADLESS PLOTTING VERIFICATION
+# =========================================================================
+def load_gru_controller(ckpt_path, d_y, d_u, max_action):
+    print(f"[*] Restoring controller from: {ckpt_path}")
+    with open(ckpt_path, 'rb') as f:
+        byte_data = f.read()
+
+    ctrl = GRUController(d_y=d_y, d_u=d_u, max_action=max_action, rngs=nnx.Rngs(0))
+    current_state_dict = nnx.state(ctrl, nnx.Param).to_pure_dict()
+    template = {'model_state': current_state_dict, 'config': {'max_u': max_action}}
+    restored = serialization.from_bytes(template, byte_data)
+    nnx.update(ctrl, restored['model_state'])
+    return ctrl
+
+def plot_gru_results():
+    csv_path = "gru_sweep_results.csv"
+    if not os.path.exists(csv_path):
+        print(f"❌ Cannot find {csv_path}. Run the GRU sweep first.")
+        return
+
+    print("[*] Loading GRU Sweep Results for Visual Evaluation...")
+    df = pd.read_csv(csv_path)
+    experiments = get_sweep_configs()
+    matrix_lookup = {exp[0]["matrix_id"]: exp[0]["A_continuous"] for exp in experiments}
+
+    d_x, d_u, d_y = 6, 3, 6
+    test_L = 150
+    dt = 0.01
+    t_test = np.linspace(0, test_L * dt, test_L)
+
+    for index, row in df.iterrows():
+        mat_id = row['matrix_id'] # Leave as string/int to match dict
+        max_u = float(row['max_u'])
+        ckpt_path = row['ctrl_path']
+        mse = float(row['sim_to_real_mse'])
+
+        print(f"[*] Generating plots for Matrix {mat_id} | max_u = {max_u}")
+
+        if not os.path.exists(ckpt_path):
+            print(f"    ❌ Checkpoint missing: {ckpt_path}")
+            continue
+
+        run = wandb.init(
+            project="tacc-dpc-sweep",
+            group="gru_saturation_sweep",
+            job_type="evaluation",
+            name=f"eval_mat{mat_id}_maxu{max_u}",
+            config={"matrix_id": mat_id, "max_u": max_u, "test_mse": mse},
+            reinit=True
+        )
+
+        A_continuous = matrix_lookup[mat_id]
+        Ad, Bd = get_discrete_matrices(A_continuous)
+
+        def simulate_real_step(x_prev, u_curr):
+            return jnp.dot(Ad, x_prev) + jnp.dot(Bd, u_curr)
+
+        ctrl = load_gru_controller(ckpt_path, d_y, d_u, max_u)
+        ctrl_carry = ctrl.initialize_carry(batch_size=1)
+
+        y_target_test = jnp.zeros((test_L, d_y))
+        x_real = jnp.array([[1.0], [-0.8], [0.5], [-0.5], [1.2], [-1.0]])
+        y_curr = x_real.flatten()
+
+        y_actual_hist, u_hist = [], []
+
+        for t in range(test_L):
+            r_t = y_target_test[t]
+            u_cmd, ctrl_carry = ctrl(y_curr, r_t, ctrl_carry)
+            u_flat = np.array(u_cmd).flatten()
+            u_hist.append(u_flat)
+
+            u_matrix = u_flat.reshape(d_u, 1)
+            x_real = simulate_real_step(x_real, u_matrix)
+            y_curr = np.array(x_real).flatten()
+            y_actual_hist.append(y_curr)
+
+        y_actual_hist = np.array(y_actual_hist)
+        u_hist = np.array(u_hist)
+
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+        fig.suptitle(f"Matrix {mat_id} | max_u = {max_u} | Final Test MSE: {mse:.4f}", fontsize=16, fontweight='bold')
+
+        for y_dim in range(d_y):
+            ax1.plot(t_test, y_actual_hist[:, y_dim], label=f"State $y_{y_dim}$", alpha=0.8)
+        ax1.plot(t_test, y_target_test[:, 0], 'k--', linewidth=2, label="Target (0.0)")
+        ax1.set_title("System States over Time")
+        ax1.set_ylabel("Amplitude")
+        ax1.legend(loc='upper right', bbox_to_anchor=(1.15, 1))
+        ax1.grid(True, alpha=0.3)
+
+        for u_dim in range(d_u):
+            ax2.plot(t_test, u_hist[:, u_dim], label=f"Control Effort $u_{u_dim}$", alpha=0.8)
+        ax2.axhline(max_u, color='red', linestyle=':', alpha=0.5, label="+ Limit")
+        ax2.axhline(-max_u, color='red', linestyle=':', alpha=0.5, label="- Limit")
+        ax2.set_title("Controller Action")
+        ax2.set_ylabel("Action")
+        ax2.set_xlabel("Time (s)")
+        ax2.legend(loc='upper right', bbox_to_anchor=(1.15, 1))
+        ax2.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+
+        # --- HEADLESS SAVING ---
+        safe_name = str(mat_id).replace(" ", "")
+        plot_filename = f"eval_mat{safe_name}_maxu{max_u}.png"
+        plt.savefig(plot_filename, bbox_inches='tight', dpi=300)
+
+        wandb.log({
+            "evaluation/sim_to_real_mse": mse,
+            "evaluation/rollout_plot": wandb.Image(plot_filename)
+        })
+
+        plt.close(fig) # Prevent memory leaks
+        run.finish()
+        time.sleep(1)
+
+
+# =========================================================================
+# 5. ORCHESTRATION MAIN LOOP
+# =========================================================================
+def run_controller_sweep():
     ray.shutdown()
-    wandb_key = os.environ.get("WANDB_API_KEY")
     
-    # --- FIX 1: Force JAX memory rules into the Ray worker payload ---
+    # --- SLURM ENVIRONMENT DETECTION ---
     ray_env = {
         "working_dir": ".", 
-        "env_vars": {
-            "WANDB_API_KEY": wandb_key if wandb_key else "",
-            "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
-            "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.10"
-        }
+        "env_vars": {"WANDB_API_KEY": os.environ.get("WANDB_API_KEY", "")}
     }
-    # -----------------------------------------------------------------
     
     if "RAY_ADDRESS" in os.environ:
         ray.init(address="auto", runtime_env=ray_env)
-        print("[*] Connected to Slurm Ray Cluster")
+        print("[*] Connected to SLURM Ray Cluster")
     else:
         ray.init(ignore_reinit_error=True, runtime_env=ray_env)
 
     print("\n[*] Initializing Stage 2: GRU Controller Sweep...")
     df_s4 = pd.read_csv("sweep_results.csv")
+
     experiments = get_sweep_configs()
-    matrix_lookup = {str(exp[0]["matrix_id"]): exp[0]["A_continuous"] for exp in experiments}
+    matrix_lookup = {exp[0]["matrix_id"]: exp[0]["A_continuous"] for exp in experiments}
 
     gru_jobs = []
-    unique_matrices = df_s4['matrix_id'].unique()[:5]
+    unique_matrices = df_s4['matrix_id'].unique()
 
     for mat_id in unique_matrices:
-        mat_id = str(mat_id)
         best_s4_row = df_s4[df_s4['matrix_id'] == mat_id].sort_values(by="mse").iloc[0]
         best_s4_path = best_s4_row['path']
-        
-        for max_u in [30.0, 50.0, 100.0, 150.0]:
-            gru_jobs.append({"mat_id": mat_id, "A_cont": matrix_lookup[mat_id], "s4_path": best_s4_path, "max_u": max_u})
+        A_continuous = matrix_lookup[mat_id]
 
-    print(f"[*] Launching {len(gru_jobs)} parallel GRU training jobs...")
+        for max_u in [30.0, 50.0, 100.0, 150.0]:
+            gru_jobs.append({
+                "mat_id": mat_id,
+                "A_cont": A_continuous,
+                "s4_path": best_s4_path,
+                "max_u": max_u
+            })
+
+    print(f"[*] Launching {len(gru_jobs)} parallel GRU training jobs on A100s...")
+
     futures = [train_single_controller.remote(j["mat_id"], j["A_cont"], j["s4_path"], j["max_u"]) for j in gru_jobs]
-    df_ctrl = pd.DataFrame(ray.get(futures))
+    results = ray.get(futures)
+    
+    df_ctrl = pd.DataFrame(results)
     df_ctrl.to_csv("gru_sweep_results.csv", index=False)
 
-    print("\n✅ GRU Sweep Complete!")
+    print("\n✅ GRU Sweep Complete! Executing Headless Plotting Evaluation...")
+    plot_gru_results()
+
+if __name__ == "__main__":
+    run_controller_sweep()
