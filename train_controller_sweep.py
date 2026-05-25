@@ -298,4 +298,4 @@ if __name__ == "__main__":
     df_ctrl.to_csv("gru_sweep_results.csv", index=False)
 
     print("\n✅ GRU Sweep Complete!")
-    plot_gru_results()
+    #plot_gru_results()
