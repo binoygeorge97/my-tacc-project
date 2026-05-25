@@ -72,6 +72,8 @@ def save_controller(ctrl, max_u_val, filename):
 @ray.remote(num_gpus=0.15) # TACC Optimized Ratio
 def train_single_controller(matrix_id, A_continuous, s4_ckpt_path, max_u_val):
     import os
+    import time
+    import random
 
     # --- FIX 2: Lustre DDoS Prevention ---
     # Randomly delay startup between 0.1 and 5.0 seconds
