@@ -6,11 +6,15 @@ import jax.numpy as jnp
 import flax.nnx as nnx
 from flax import serialization
 import matplotlib.pyplot as plt
+import wandb
 
 # =========================================================================
 # 0. LOCAL MODULE IMPORTS
 # =========================================================================
+# Import from the 'model' folder
 from model.s4_code import StackedModelRegression, S4LayerEnsemble
+
+# Import from the 'data' folder
 from data.dataloader import get_discrete_matrices, create_microgrid_dataloaders, DatasetMetadata
 from data.systems import get_sweep_configs
 
@@ -74,12 +78,18 @@ def visualize_system_plots(inputs, targets, preds, dataset_name="microgrid", n_p
         ax_out.legend(loc='upper right')
 
     plt.tight_layout()
+    
+    # Save locally
     safe_title = custom_title.replace(" | ", "_").replace("=", "").replace(" ", "_")
     save_path = f"plots/{safe_title}.png"
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     plt.savefig(save_path, bbox_inches='tight', dpi=300)
     plt.close(fig)
     print(f"[*] Saved evaluation plot to {save_path}")
+
+    # Push to W&B
+    if wandb.run is not None:
+        wandb.log({f"Evaluation_Plots/{safe_title}": wandb.Image(save_path)})
 
 # =========================================================================
 # 2. INFERENCE RUNNER
@@ -120,11 +130,19 @@ def run_evaluation(model, Ad, Bd, d_model, n_layers, dataset_name="microgrid", c
 # 3. BATCH EVALUATION EXECUTION
 # =========================================================================
 if __name__ == "__main__":
+    # 1. Initialize a single W&B run for all plots
+    wandb.init(
+        project="tacc-microgrid-s4-sweep",
+        name="post_sweep_evaluation",
+        job_type="evaluation"
+    )
+
     checkpoint_dir = "checkpoints/sweep/"
     model_files = glob.glob(os.path.join(checkpoint_dir, "*.msgpack"))
     
     if not model_files:
         print("[!] No checkpoints found in", checkpoint_dir)
+        wandb.finish()
         exit()
 
     # Get the raw continuous matrices so we can re-discretize them for the test loader
@@ -155,3 +173,7 @@ if __name__ == "__main__":
             n_layers=config_dict['model']['n_layers'], 
             custom_title=plot_title
         )
+        
+    # Close out the W&B run cleanly
+    print("\n✅ Evaluation Complete! All plots saved locally and uploaded to Weights & Biases.")
+    wandb.finish()
