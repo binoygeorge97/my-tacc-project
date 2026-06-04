@@ -190,107 +190,142 @@ def train_single_model(matrix_dict, hp_dict):
     return {"matrix_id": matrix_id, "mse": final_mse, "path": unique_save_path}
 
 
-# =========================================================================
-# 4. HEADLESS PLOTTING & EVALUATION
-# =========================================================================
-def visualize_system_plots(inputs, targets, preds, dataset_name="microgrid", n_plot=3, max_channels=4, custom_title=""):
-    inputs, targets, preds = np.array(inputs), np.array(targets), np.array(preds)
-    meta = DatasetMetadata.get(dataset_name, {})
-    dt = meta.get("dt", 0.01)
+# # =========================================================================
+# # 4. HEADLESS PLOTTING & EVALUATION
+# # =========================================================================
+# def visualize_system_plots(inputs, targets, preds, dataset_name="microgrid", n_plot=3, max_channels=4, custom_title=""):
+#     inputs, targets, preds = np.array(inputs), np.array(targets), np.array(preds)
+#     meta = DatasetMetadata.get(dataset_name, {})
+#     dt = meta.get("dt", 0.01)
     
-    in_labels = meta.get("input_labels", [f"Input Ch {d}" for d in range(inputs.shape[-1])])
-    out_labels = meta.get("output_labels", [f"Output Ch {d}" for d in range(targets.shape[-1])])
-    time_arr = np.arange(inputs.shape[1]) * dt
+#     in_labels = meta.get("input_labels", [f"Input Ch {d}" for d in range(inputs.shape[-1])])
+#     out_labels = meta.get("output_labels", [f"Output Ch {d}" for d in range(targets.shape[-1])])
+#     time_arr = np.arange(inputs.shape[1]) * dt
 
-    fig, axes = plt.subplots(n_plot, 2, figsize=(16, 4 * n_plot), squeeze=False)
-    fig.suptitle(custom_title, fontsize=16, fontweight='bold')
+#     fig, axes = plt.subplots(n_plot, 2, figsize=(16, 4 * n_plot), squeeze=False)
+#     fig.suptitle(custom_title, fontsize=16, fontweight='bold')
 
-    for i in range(n_plot):
-        ax_in, ax_out = axes[i, 0], axes[i, 1]
+#     for i in range(n_plot):
+#         ax_in, ax_out = axes[i, 0], axes[i, 1]
         
-        # Plot Inputs
-        for d in range(min(inputs.shape[-1], max_channels)):
-            ax_in.plot(time_arr, inputs[i, :, d], alpha=0.7, label=in_labels[d] if d < len(in_labels) else f"In {d}")
-        ax_in.set_title(f"Sample {i}: Inputs")
-        ax_in.grid(True, alpha=0.3)
-        ax_in.legend(loc='upper right')
+#         # Plot Inputs
+#         for d in range(min(inputs.shape[-1], max_channels)):
+#             ax_in.plot(time_arr, inputs[i, :, d], alpha=0.7, label=in_labels[d] if d < len(in_labels) else f"In {d}")
+#         ax_in.set_title(f"Sample {i}: Inputs")
+#         ax_in.grid(True, alpha=0.3)
+#         ax_in.legend(loc='upper right')
 
-        # Plot Outputs
-        total_mse = 0.0
-        for d in range(min(targets.shape[-1], max_channels)):
-            label_name = out_labels[d] if d < len(out_labels) else f"Out {d}"
-            ax_out.plot(time_arr, targets[i, :, d], '-', linewidth=2, alpha=0.5, label=f'True: {label_name}')
-            ax_out.plot(time_arr, preds[i, :, d], '--', linewidth=1.5, label=f'Pred: {label_name}')
-            total_mse += np.mean((targets[i, :, d] - preds[i, :, d])**2)
+#         # Plot Outputs
+#         total_mse = 0.0
+#         for d in range(min(targets.shape[-1], max_channels)):
+#             label_name = out_labels[d] if d < len(out_labels) else f"Out {d}"
+#             ax_out.plot(time_arr, targets[i, :, d], '-', linewidth=2, alpha=0.5, label=f'True: {label_name}')
+#             ax_out.plot(time_arr, preds[i, :, d], '--', linewidth=1.5, label=f'Pred: {label_name}')
+#             total_mse += np.mean((targets[i, :, d] - preds[i, :, d])**2)
             
-        ax_out.set_title(f"Sample {i}: Outputs (Avg MSE: {total_mse/targets.shape[-1]:.5f})")
-        ax_out.grid(True, alpha=0.3)
-        ax_out.legend(loc='upper right')
+#         ax_out.set_title(f"Sample {i}: Outputs (Avg MSE: {total_mse/targets.shape[-1]:.5f})")
+#         ax_out.grid(True, alpha=0.3)
+#         ax_out.legend(loc='upper right')
 
-    plt.tight_layout()
+#     plt.tight_layout()
     
-    # MODIFIED FOR TACC: Save to file instead of plt.show()
-    safe_title = custom_title.replace(" | ", "_").replace("=", "").replace(" ", "_")
-    save_path = f"{safe_title}.png"
-    plt.savefig(save_path, bbox_inches='tight', dpi=300)
+#     # MODIFIED FOR TACC: Save to file instead of plt.show()
+#     safe_title = custom_title.replace(" | ", "_").replace("=", "").replace(" ", "_")
+#     save_path = f"{safe_title}.png"
+#     plt.savefig(save_path, bbox_inches='tight', dpi=300)
     
-    # --- NEW: Upload the image to W&B if a run is currently active ---
-    import wandb
-    if wandb.run is not None:
-        wandb.log({"Evaluation_Plots": wandb.Image(save_path)})
-    # -----------------------------------------------------------------
+#     # --- NEW: Upload the image to W&B if a run is currently active ---
+#     import wandb
+#     if wandb.run is not None:
+#         wandb.log({"Evaluation_Plots": wandb.Image(save_path)})
+#     # -----------------------------------------------------------------
     
-    plt.close(fig)
-    print(f"[*] Saved evaluation plot to {save_path} and logged to W&B")
+#     plt.close(fig)
+#     print(f"[*] Saved evaluation plot to {save_path} and logged to W&B")
 
 
-def run_evaluation(model, Ad, Bd, d_model, n_layers, dataset_name="microgrid", custom_title=""):
-    print(f"[*] Running Step-by-Step RNN Inference for: {custom_title}")
+# def run_evaluation(model, Ad, Bd, d_model, n_layers, dataset_name="microgrid", custom_title=""):
+#     print(f"[*] Running Step-by-Step RNN Inference for: {custom_title}")
 
-    l_max, bsz = 100, 32
-    _, testloader, _, _ = create_microgrid_dataloaders(Ad, Bd, bsz=bsz, L=l_max)
+#     l_max, bsz = 100, 32
+#     _, testloader, _, _ = create_microgrid_dataloaders(Ad, Bd, bsz=bsz, L=l_max)
 
-    inputs_u, targets_y = jnp.array(testloader[0][0]), jnp.array(testloader[0][1])
-    H_dim, N_dim = d_model, 64 
+#     inputs_u, targets_y = jnp.array(testloader[0][0]), jnp.array(testloader[0][1])
+#     H_dim, N_dim = d_model, 64 
 
-    @nnx.jit
-    def step_by_step_inference(model, inputs):
-        B_batch, L, D = inputs.shape
-        inputs_t = jnp.transpose(inputs, (1, 0, 2))
-        init_states = [jnp.zeros((B_batch, H_dim, N_dim), dtype=jnp.complex64) for _ in range(n_layers)]
+#     @nnx.jit
+#     def step_by_step_inference(model, inputs):
+#         B_batch, L, D = inputs.shape
+#         inputs_t = jnp.transpose(inputs, (1, 0, 2))
+#         init_states = [jnp.zeros((B_batch, H_dim, N_dim), dtype=jnp.complex64) for _ in range(n_layers)]
 
-        def scan_step(carry, x_t):
-            model_carry, current_states_batch = carry
-            def single_sample_step(m, x, s):
-                pred, new_s = m(x, states=s, training=False)
-                return pred, new_s
+#         def scan_step(carry, x_t):
+#             model_carry, current_states_batch = carry
+#             def single_sample_step(m, x, s):
+#                 pred, new_s = m(x, states=s, training=False)
+#                 return pred, new_s
 
-            runner = nnx.vmap(
-                single_sample_step,
-                in_axes=(nnx.StateAxes({nnx.Param: None}), 0, 0),
-                out_axes=(0, 0)
-            )
-            pred_batch, new_states_batch = runner(model_carry, x_t, current_states_batch)
-            return (model_carry, new_states_batch), pred_batch
+#             runner = nnx.vmap(
+#                 single_sample_step,
+#                 in_axes=(nnx.StateAxes({nnx.Param: None}), 0, 0),
+#                 out_axes=(0, 0)
+#             )
+#             pred_batch, new_states_batch = runner(model_carry, x_t, current_states_batch)
+#             return (model_carry, new_states_batch), pred_batch
 
-        initial_carry = (model, init_states)
-        _, preds_t = nnx.scan(scan_step, in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))(initial_carry, inputs_t)
-        return jnp.transpose(preds_t, (1, 0, 2))
+#         initial_carry = (model, init_states)
+#         _, preds_t = nnx.scan(scan_step, in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))(initial_carry, inputs_t)
+#         return jnp.transpose(preds_t, (1, 0, 2))
 
-    preds_y = step_by_step_inference(model, inputs_u)
-    visualize_system_plots(inputs_u, targets_y, preds_y, n_plot=3, dataset_name=dataset_name, custom_title=custom_title)
+#     preds_y = step_by_step_inference(model, inputs_u)
+#     visualize_system_plots(inputs_u, targets_y, preds_y, n_plot=3, dataset_name=dataset_name, custom_title=custom_title)
+
+
+# # =========================================================================
+# # 5. MAIN EXECUTION
+# # =========================================================================
+# if __name__ == "__main__":
+#     import os
+    
+#     # 1. Connect to Ray and pass W&B key to workers
+#     wandb_key = os.environ.get("WANDB_API_KEY")
+    
+#     # --- CRITICAL FIX: Pass XLA memory limits here so they exist before JAX imports ---
+#     ray_env = {
+#         "working_dir": ".",  
+#         "env_vars": {
+#             "WANDB_API_KEY": wandb_key,
+#             "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+#             "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.10"
+#         }
+#     }
+#     # ----------------------------------------------------------------------------------
+
+#     if "RAY_ADDRESS" in os.environ:
+#         ray.init(address="auto", runtime_env=ray_env)
+#         print("[*] Connected to Slurm Ray Cluster")
+#     else:
+#         ray.init(ignore_reinit_error=True, runtime_env=ray_env)
+
+#     # 2. Execute the Sweep
+#     print("[*] Launching Ray Sweep...")
+#     experiments = get_sweep_configs()
+#     futures = [train_single_model.remote(mat, hp) for mat, hp in experiments]
+#     results = ray.get(futures)
+    
+#     # 3. Save Sweep Results
+#     df = pd.DataFrame(results)
+#     csv_path = "sweep_results.csv"
+#     df.to_csv(csv_path, index=False)
+#     print(f"\n✅ Sweep Complete! Results saved to {csv_path}")
 
 
 # =========================================================================
-# 5. MAIN EXECUTION
+# 3. MAIN EXECUTION
 # =========================================================================
 if __name__ == "__main__":
-    import os
+    wandb_key = os.environ.get("WANDB_API_KEY", "")
     
-    # 1. Connect to Ray and pass W&B key to workers
-    wandb_key = os.environ.get("WANDB_API_KEY")
-    
-    # --- CRITICAL FIX: Pass XLA memory limits here so they exist before JAX imports ---
     ray_env = {
         "working_dir": ".",  
         "env_vars": {
@@ -299,7 +334,6 @@ if __name__ == "__main__":
             "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.10"
         }
     }
-    # ----------------------------------------------------------------------------------
 
     if "RAY_ADDRESS" in os.environ:
         ray.init(address="auto", runtime_env=ray_env)
@@ -307,13 +341,11 @@ if __name__ == "__main__":
     else:
         ray.init(ignore_reinit_error=True, runtime_env=ray_env)
 
-    # 2. Execute the Sweep
     print("[*] Launching Ray Sweep...")
     experiments = get_sweep_configs()
     futures = [train_single_model.remote(mat, hp) for mat, hp in experiments]
     results = ray.get(futures)
     
-    # 3. Save Sweep Results
     df = pd.DataFrame(results)
     csv_path = "sweep_results.csv"
     df.to_csv(csv_path, index=False)
