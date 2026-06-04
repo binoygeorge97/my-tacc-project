@@ -142,8 +142,8 @@ import wandb
 
 @ray.remote(num_gpus=0.2)
 def train_single_model(matrix_dict, hp_dict):
-    os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.10"
-    os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+    # os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.10"
+    # os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
     
     matrix_id, A_continuous = matrix_dict["matrix_id"], matrix_dict["A_continuous"]
     
@@ -289,13 +289,17 @@ if __name__ == "__main__":
     
     # 1. Connect to Ray and pass W&B key to workers
     wandb_key = os.environ.get("WANDB_API_KEY")
-    #ray_env = {"env_vars": {"WANDB_API_KEY": wandb_key}} if wandb_key else {}
-    # --- CRITICAL FIX: Add working_dir ---
+    
+    # --- CRITICAL FIX: Pass XLA memory limits here so they exist before JAX imports ---
     ray_env = {
-        "working_dir": ".",  # This tells Ray to copy data/ and model/ to all nodes
-        "env_vars": {"WANDB_API_KEY": wandb_key} if wandb_key else {}
+        "working_dir": ".",  
+        "env_vars": {
+            "WANDB_API_KEY": wandb_key,
+            "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+            "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.10"
+        }
     }
-    # -------------------------------------
+    # ----------------------------------------------------------------------------------
 
     if "RAY_ADDRESS" in os.environ:
         ray.init(address="auto", runtime_env=ray_env)
