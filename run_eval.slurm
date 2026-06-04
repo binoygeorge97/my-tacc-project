@@ -7,6 +7,8 @@
 #SBATCH -n 1                        # 1 task
 #SBATCH -t 00:30:00                 # Short 30 minute runtime limit
 #SBATCH -A IRI26016 
+#SBATCH --mail-user=phdstudiescontrols@gmail.com
+#SBATCH --mail-type=BEGIN,END,FAIL
 
 # 1. Load Core TACC Modules
 module purge
