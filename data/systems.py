@@ -2,7 +2,7 @@
 import numpy as np
 
 def get_sweep_configs():
-    hp = {"d_model": 128, "n_layers": 2, "dropout": 0.0, "prenorm": True, "lr": 1e-3, "batch_size": 32, "epochs": 30, "N": 64, "l_max": 100}
+    hp = {"d_model": 128, "n_layers": 2, "dropout": 0.0, "prenorm": True, "lr": 1e-3, "batch_size": 32, "epochs": 70, "N": 64, "l_max": 100}
     hp_marginal = hp.copy()
     hp_marginal["d_model"] = 64
     Z = np.zeros((2, 2))
@@ -11,7 +11,7 @@ def get_sweep_configs():
     # Matrix 1
     A1 = np.block([[np.array([[-3.5, -2.4], [0.0, 0.0]]), np.array([[0.0, 0.03], [0.0, 0.0]]), np.array([[0.0, 0.06], [0.0, 0.0]])],
                    [Z, np.array([[-3.5, -2.3], [0.0, 0.0]]), Z], [Z, Z, np.array([[-5.2, -5.3], [0.0, 0.0]])]])
-    configs.append([{"matrix_id": "1", "A_continuous": A1}, hp_marginal])
+
 
 
     # Matrix 1A
@@ -26,7 +26,7 @@ def get_sweep_configs():
         [Z, A5_1a, Z],
         [Z, Z, A6_1a]
     ])
-    configs.append([{"matrix_id": "1a", "A_continuous": A1a}, hp_marginal])
+
 
 
     # Matrix 1B
@@ -41,12 +41,11 @@ def get_sweep_configs():
         [Z, A5_1b, Z],
         [Z, Z, A6_1b]
     ])
-    configs.append([{"matrix_id": "1b", "A_continuous": A1b}, hp_marginal])
 
-    
+
     # Matrix 2
     A2 = np.block([[np.array([[1.0, 0.5], [0.0, 2.0]]), Z, Z], [Z, np.array([[1.5, 0.5], [0.0, 3.0]]), Z], [Z, Z, np.array([[0.5, 0.5], [0.0, 4.0]])]])
-    configs.append([{"matrix_id": 2, "A_continuous": A2}, hp])
+
 
     # Matrix 2A
     A4_2a = np.array([[1.2, 0.3],
@@ -54,7 +53,7 @@ def get_sweep_configs():
 
     A5_2a = np.array([[1.7, 0.4],
                    [0.0, 3.5]])
-    
+
     A6_2a = np.array([[0.8, 0.6],
                    [0.0, 4.5]])
     A2a = np.block([
@@ -62,7 +61,6 @@ def get_sweep_configs():
         [Z, A5_2a, Z],
         [Z, Z, A6_2a]
     ])
-    configs.append([{"matrix_id": "2a", "A_continuous": A2a}, hp])
 
     # Matrix 2B
     A4_2b = np.array([[0.9, 0.7],
@@ -70,7 +68,7 @@ def get_sweep_configs():
 
     A5_2b = np.array([[1.3, 0.8],
                    [0.0, 2.7]])
-    
+
     A6_2b = np.array([[1.1, 0.5],
                    [0.0, 3.9]])
     A2b = np.block([
@@ -78,9 +76,8 @@ def get_sweep_configs():
         [Z, A5_2b, Z],
         [Z, Z, A6_2b]
     ])
-    configs.append([{"matrix_id": "2b", "A_continuous": A2b}, hp])
-    
-    
+
+
     # ==========================================
     # 3. Oscillatory unstable (complex eigenvalues)
     # ==========================================
@@ -99,7 +96,6 @@ def get_sweep_configs():
         [Z, Z, A6_3]
     ])
 
-    configs.append([{"matrix_id": "3", "A_continuous": A3}, hp])
 
 
     # Matrix 3A
@@ -118,7 +114,6 @@ def get_sweep_configs():
         [Z, Z, A6_3a]
     ])
 
-    configs.append([{"matrix_id": "3a", "A_continuous": A3a}, hp])
 
 
     # Matrix 3B
@@ -137,7 +132,6 @@ def get_sweep_configs():
         [Z, Z, A6_3b]
     ])
 
-    configs.append([{"matrix_id": "3b", "A_continuous": A3b}, hp])
 
 
     # ==========================================
@@ -152,13 +146,12 @@ def get_sweep_configs():
     A6_4 = np.array([[2.0, 120.0],
                      [0.0,   2.0]])
 
-    A4_case = np.block([
+    A4 = np.block([
         [A4_4, Z, Z],
         [Z, A5_4, Z],
         [Z, Z, A6_4]
     ])
 
-    configs.append([{"matrix_id": "4", "A_continuous": A4_case}, hp])
 
 
     # Matrix 4A
@@ -177,7 +170,6 @@ def get_sweep_configs():
         [Z, Z, A6_4a]
     ])
 
-    configs.append([{"matrix_id": "4a", "A_continuous": A4a}, hp])
 
 
     # Matrix 4B
@@ -196,7 +188,6 @@ def get_sweep_configs():
         [Z, Z, A6_4b]
     ])
 
-    configs.append([{"matrix_id": "4b", "A_continuous": A4b}, hp])
 
 
     # ==========================================
@@ -220,13 +211,12 @@ def get_sweep_configs():
     H56_5 = np.array([[ 0.25, -0.15],
                       [ 0.0,   0.2]])
 
-    A5_case = np.block([
+    A5 = np.block([
         [A4_5, H45_5, H46_5],
         [Z,    A5_5,  H56_5],
         [Z,    Z,     A6_5 ]
     ])
 
-    configs.append([{"matrix_id": "5", "A_continuous": A5_case}, hp])
 
 
     # Matrix 5A
@@ -254,7 +244,6 @@ def get_sweep_configs():
         [Z,     Z,      A6_5a ]
     ])
 
-    configs.append([{"matrix_id": "5a", "A_continuous": A5a}, hp])
 
 
     # Matrix 5B
@@ -282,7 +271,6 @@ def get_sweep_configs():
         [Z,     Z,      A6_5b ]
     ])
 
-    configs.append([{"matrix_id": "5b", "A_continuous": A5b}, hp])
 
 
     # ==========================================
@@ -297,13 +285,12 @@ def get_sweep_configs():
     A6_6 = np.array([[2.0, 1200.0],
                      [0.0015,  2.0]])
 
-    A6_case = np.block([
+    A6 = np.block([
         [A4_6, Z, Z],
         [Z, A5_6, Z],
         [Z, Z, A6_6]
     ])
 
-    configs.append([{"matrix_id": "6", "A_continuous": A6_case}, hp])
 
 
     # Matrix 6A
@@ -322,7 +309,6 @@ def get_sweep_configs():
         [Z, Z, A6_6a]
     ])
 
-    configs.append([{"matrix_id": "6a", "A_continuous": A6a}, hp])
 
 
     # Matrix 6B
@@ -341,7 +327,6 @@ def get_sweep_configs():
         [Z, Z, A6_6b]
     ])
 
-    configs.append([{"matrix_id": "6b", "A_continuous": A6b}, hp])
 
 
     # ==========================================
@@ -362,7 +347,6 @@ def get_sweep_configs():
         [Z, Z, A6_7]
     ])
 
-    configs.append([{"matrix_id": "7", "A_continuous": A7}, hp])
 
 
     # Matrix 7A
@@ -381,7 +365,6 @@ def get_sweep_configs():
         [Z, Z, A6_7a]
     ])
 
-    configs.append([{"matrix_id": "7a", "A_continuous": A7a}, hp])
 
 
     # Matrix 7B
@@ -400,6 +383,30 @@ def get_sweep_configs():
         [Z, Z, A6_7b]
     ])
 
-    configs.append([{"matrix_id": "7b", "A_continuous": A7b}, hp])
+
+
+    configs.append([{"matrix_id": "1", "A_continuous": A1}, hp_marginal])
+    configs.append([{"matrix_id": "2", "A_continuous": A2}, hp])
+    configs.append([{"matrix_id": "3", "A_continuous": A3}, hp])
+    configs.append([{"matrix_id": "4", "A_continuous": A4}, hp])
+    configs.append([{"matrix_id": "5", "A_continuous": A5}, hp])
+    configs.append([{"matrix_id": "6", "A_continuous": A6}, hp])
+    configs.append([{"matrix_id": "7", "A_continuous": A7}, hp])
+
+
+    configs.append([{"matrix_id": "1a", "A_continuous": A1a}, hp_marginal])
+    # configs.append([{"matrix_id": "1b", "A_continuous": A1b}, hp_marginal])
+    # configs.append([{"matrix_id": "2a", "A_continuous": A2a}, hp])
+    # configs.append([{"matrix_id": "2b", "A_continuous": A2b}, hp])
+    # configs.append([{"matrix_id": "3a", "A_continuous": A3a}, hp])
+    # configs.append([{"matrix_id": "3b", "A_continuous": A3b}, hp])
+    # configs.append([{"matrix_id": "4a", "A_continuous": A4a}, hp])
+    # configs.append([{"matrix_id": "4b", "A_continuous": A4b}, hp])
+    # configs.append([{"matrix_id": "5a", "A_continuous": A5a}, hp])
+    # configs.append([{"matrix_id": "5b", "A_continuous": A5b}, hp])
+    # configs.append([{"matrix_id": "6a", "A_continuous": A6a}, hp])
+    # configs.append([{"matrix_id": "6b", "A_continuous": A6b}, hp])
+    # configs.append([{"matrix_id": "7a", "A_continuous": A7a}, hp])
+    # configs.append([{"matrix_id": "7b", "A_continuous": A7b}, hp])
 
     return configs
