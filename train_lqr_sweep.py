@@ -212,15 +212,18 @@ def train_single_model(matrix_dict, hp_dict):
     wandb.finish()
     return {"matrix_id": matrix_id, "mse": final_mse, "path": unique_save_path}
 
+
 # =========================================================================
 # 4. CLOSED-LOOP ROLLOUT & PLOTTING
 # =========================================================================
-def visualize_lqr_plots(controlled_inputs, states, dataset_name="microgrid", n_plot=3, max_channels=4, custom_title=""):
+def visualize_lqr_plots(controlled_inputs, states, dataset_name="microgrid", n_plot=3, custom_title=""):
     controlled_inputs, states = np.array(controlled_inputs), np.array(states)
     meta = DatasetMetadata.get(dataset_name, {})
     dt = meta.get("dt", 0.01)
     
-    in_labels = meta.get("input_labels", [f"Control Actuator {d}" for d in range(controlled_inputs.shape[-1])])
+    # --- FIX 1: Correctly slice the 3 control labels and 6 state labels ---
+    all_in_labels = meta.get("input_labels", [f"Input Ch {d}" for d in range(9)])
+    in_labels = all_in_labels[-controlled_inputs.shape[-1]:] 
     out_labels = meta.get("output_labels", [f"State Ch {d}" for d in range(states.shape[-1])])
     time_arr = np.arange(states.shape[1]) * dt
 
@@ -231,44 +234,44 @@ def visualize_lqr_plots(controlled_inputs, states, dataset_name="microgrid", n_p
         ax_in, ax_out = axes[i, 0], axes[i, 1]
         
         # Plot Generated LQR Control Inputs (u_t)
-        for d in range(min(controlled_inputs.shape[-1], max_channels)):
+        for d in range(controlled_inputs.shape[-1]):
             ax_in.plot(time_arr, controlled_inputs[i, :, d], alpha=0.8, label=in_labels[d])
         ax_in.set_title(f"Sample {i}: LQR Control Action ($u_t$)")
         ax_in.grid(True, alpha=0.3)
+        # --- FIX 2: Add zero-axis dotted line ---
+        ax_in.axhline(0, color='black', linestyle='--', linewidth=1.2, alpha=0.6)
         ax_in.legend(loc='upper right')
 
         # Plot Regulated Plant States (y_t decaying to zero)
-        for d in range(min(states.shape[-1], max_channels)):
+        for d in range(states.shape[-1]):
             ax_out.plot(time_arr, states[i, :, d], '-', linewidth=2, alpha=0.8, label=out_labels[d])
             
         ax_out.set_title(f"Sample {i}: Regulated Plant States ($y_t$)")
         ax_out.grid(True, alpha=0.3)
+        # --- FIX 2: Add zero-axis dotted line ---
+        ax_out.axhline(0, color='black', linestyle='--', linewidth=1.2, alpha=0.6)
         ax_out.legend(loc='upper right')
 
     plt.tight_layout()
     
-    # Clean the title string for file naming
     safe_title = custom_title.replace(" | ", "_").replace("=", "").replace(" ", "_").replace("$", "").replace("^", "")
     save_dir = "plots"
     os.makedirs(save_dir, exist_ok=True)
     relative_path = os.path.join(save_dir, f"{safe_title}.png")
     
-    # --- CRITICAL FIX 2: Compute Absolute Paths to map from Ray Virtual Environments ---
     abs_save_path = os.path.abspath(relative_path)
     plt.savefig(abs_save_path, bbox_inches='tight', dpi=300)
-    
-    # --- CRITICAL FIX 3: Push using the absolute file path destination ---
-    if wandb.run is not None:
-        wandb.log({"Closed_Loop_LQR_Plots": wandb.Image(abs_save_path)})
-        print(f"[*] Successfully logged plot to W&B run: {wandb.run.name}")
-        
     plt.close(fig)
     print(f"[*] Saved closed-loop control plot locally to {abs_save_path}")
+    
+    # --- FIX 3: Return the explicit path to the Ray worker to handle uploading ---
+    return abs_save_path
 
 def run_lqr_evaluation(model, Ad, Bd, K, d_model, n_layers, dataset_name="microgrid", custom_title=""):
     print(f"[*] Simulating Closed-Loop LQR + S4 System Rollout...")
 
-    l_max, bsz = 100, 32
+    # --- FIX 4: Extend simulation horizon to 200 (2.0 seconds) ---
+    l_max, bsz = 200, 32
     _, testloader, _, _ = create_microgrid_dataloaders(Ad, Bd, bsz=bsz, L=l_max)
 
     targets_y = jnp.array(testloader[0][1]) 
@@ -285,14 +288,9 @@ def run_lqr_evaluation(model, Ad, Bd, K, d_model, n_layers, dataset_name="microg
         def lqr_step(carry, _):
             model_carry, current_s4_states, y_prev = carry
             
-            # 1. Compute control law: u_t = -K * y_{t-1}
-            # y_prev is (B_batch, 6), K_jax.T is (6, 3) -> u_t is (B_batch, 3)
             u_t = -jnp.matmul(y_prev, K_jax.T)
             
-            # --- THE FIX: Concatenate state and control action ---
-            # The S4 model was trained with d_input=9, expecting [x_t, u_t]
             s4_input = jnp.concatenate([y_prev, u_t], axis=-1)
-            # ----------------------------------------------------
             
             def single_sample_step(m, x, s):
                 pred, new_s = m(x, states=s, training=False)
@@ -304,7 +302,6 @@ def run_lqr_evaluation(model, Ad, Bd, K, d_model, n_layers, dataset_name="microg
                 out_axes=(0, 0)
             )
             
-            # 2. Pass the concatenated 9-dimensional vector into the S4 plant
             y_next, next_s4_states = vmap_runner(model_carry, s4_input, current_s4_states)
             
             return (model_carry, next_s4_states, y_next), (u_t, y_next)
@@ -319,7 +316,120 @@ def run_lqr_evaluation(model, Ad, Bd, K, d_model, n_layers, dataset_name="microg
         return jnp.transpose(inputs_u_history, (1, 0, 2)), jnp.transpose(states_y_history, (1, 0, 2))
 
     u_rollout, y_rollout = closed_loop_scan(model, initial_states)
-    visualize_lqr_plots(u_rollout, y_rollout, dataset_name=dataset_name, n_plot=3, custom_title=custom_title)
+    
+    # --- FIX 5: Pass the image path up the chain back to the main worker ---
+    return visualize_lqr_plots(u_rollout, y_rollout, dataset_name=dataset_name, n_plot=3, custom_title=custom_title)
+
+
+
+# # =========================================================================
+# # 4. CLOSED-LOOP ROLLOUT & PLOTTING
+# # =========================================================================
+# def visualize_lqr_plots(controlled_inputs, states, dataset_name="microgrid", n_plot=3, max_channels=4, custom_title=""):
+#     controlled_inputs, states = np.array(controlled_inputs), np.array(states)
+#     meta = DatasetMetadata.get(dataset_name, {})
+#     dt = meta.get("dt", 0.01)
+    
+#     in_labels = meta.get("input_labels", [f"Control Actuator {d}" for d in range(controlled_inputs.shape[-1])])
+#     out_labels = meta.get("output_labels", [f"State Ch {d}" for d in range(states.shape[-1])])
+#     time_arr = np.arange(states.shape[1]) * dt
+
+#     fig, axes = plt.subplots(n_plot, 2, figsize=(16, 4 * n_plot), squeeze=False)
+#     fig.suptitle(custom_title, fontsize=14, fontweight='bold')
+
+#     for i in range(n_plot):
+#         ax_in, ax_out = axes[i, 0], axes[i, 1]
+        
+#         # Plot Generated LQR Control Inputs (u_t)
+#         for d in range(min(controlled_inputs.shape[-1], max_channels)):
+#             ax_in.plot(time_arr, controlled_inputs[i, :, d], alpha=0.8, label=in_labels[d])
+#         ax_in.set_title(f"Sample {i}: LQR Control Action ($u_t$)")
+#         ax_in.grid(True, alpha=0.3)
+#         ax_in.legend(loc='upper right')
+
+#         # Plot Regulated Plant States (y_t decaying to zero)
+#         for d in range(min(states.shape[-1], max_channels)):
+#             ax_out.plot(time_arr, states[i, :, d], '-', linewidth=2, alpha=0.8, label=out_labels[d])
+            
+#         ax_out.set_title(f"Sample {i}: Regulated Plant States ($y_t$)")
+#         ax_out.grid(True, alpha=0.3)
+#         ax_out.legend(loc='upper right')
+
+#     plt.tight_layout()
+    
+#     # Clean the title string for file naming
+#     safe_title = custom_title.replace(" | ", "_").replace("=", "").replace(" ", "_").replace("$", "").replace("^", "")
+#     save_dir = "plots"
+#     os.makedirs(save_dir, exist_ok=True)
+#     relative_path = os.path.join(save_dir, f"{safe_title}.png")
+    
+#     # --- CRITICAL FIX 2: Compute Absolute Paths to map from Ray Virtual Environments ---
+#     abs_save_path = os.path.abspath(relative_path)
+#     plt.savefig(abs_save_path, bbox_inches='tight', dpi=300)
+    
+#     # --- CRITICAL FIX 3: Push using the absolute file path destination ---
+#     if wandb.run is not None:
+#         wandb.log({"Closed_Loop_LQR_Plots": wandb.Image(abs_save_path)})
+#         print(f"[*] Successfully logged plot to W&B run: {wandb.run.name}")
+        
+#     plt.close(fig)
+#     print(f"[*] Saved closed-loop control plot locally to {abs_save_path}")
+
+# def run_lqr_evaluation(model, Ad, Bd, K, d_model, n_layers, dataset_name="microgrid", custom_title=""):
+#     print(f"[*] Simulating Closed-Loop LQR + S4 System Rollout...")
+
+#     l_max, bsz = 100, 32
+#     _, testloader, _, _ = create_microgrid_dataloaders(Ad, Bd, bsz=bsz, L=l_max)
+
+#     targets_y = jnp.array(testloader[0][1]) 
+#     initial_states = targets_y[:, 0, :] 
+    
+#     H_dim, N_dim = d_model, 64 
+#     K_jax = jnp.array(K)
+
+#     @nnx.jit
+#     def closed_loop_scan(model, x0):
+#         B_batch = x0.shape[0]
+#         init_s4_states = [jnp.zeros((B_batch, H_dim, N_dim), dtype=jnp.complex64) for _ in range(n_layers)]
+
+#         def lqr_step(carry, _):
+#             model_carry, current_s4_states, y_prev = carry
+            
+#             # 1. Compute control law: u_t = -K * y_{t-1}
+#             # y_prev is (B_batch, 6), K_jax.T is (6, 3) -> u_t is (B_batch, 3)
+#             u_t = -jnp.matmul(y_prev, K_jax.T)
+            
+#             # --- THE FIX: Concatenate state and control action ---
+#             # The S4 model was trained with d_input=9, expecting [x_t, u_t]
+#             s4_input = jnp.concatenate([y_prev, u_t], axis=-1)
+#             # ----------------------------------------------------
+            
+#             def single_sample_step(m, x, s):
+#                 pred, new_s = m(x, states=s, training=False)
+#                 return pred, new_s
+
+#             vmap_runner = nnx.vmap(
+#                 single_sample_step, 
+#                 in_axes=(nnx.StateAxes({nnx.Param: None}), 0, 0), 
+#                 out_axes=(0, 0)
+#             )
+            
+#             # 2. Pass the concatenated 9-dimensional vector into the S4 plant
+#             y_next, next_s4_states = vmap_runner(model_carry, s4_input, current_s4_states)
+            
+#             return (model_carry, next_s4_states, y_next), (u_t, y_next)
+
+#         initial_carry = (model, init_s4_states, x0)
+#         _, (inputs_u_history, states_y_history) = nnx.scan(
+#             lqr_step, 
+#             in_axes=(nnx.Carry, 0), 
+#             out_axes=(nnx.Carry, 0)
+#         )(initial_carry, jnp.arange(l_max))
+        
+#         return jnp.transpose(inputs_u_history, (1, 0, 2)), jnp.transpose(states_y_history, (1, 0, 2))
+
+#     u_rollout, y_rollout = closed_loop_scan(model, initial_states)
+#     visualize_lqr_plots(u_rollout, y_rollout, dataset_name=dataset_name, n_plot=3, custom_title=custom_title)
 
 # =========================================================================
 # 5. MAIN EXECUTION
