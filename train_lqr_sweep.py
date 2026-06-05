@@ -285,15 +285,27 @@ def run_lqr_evaluation(model, Ad, Bd, K, d_model, n_layers, dataset_name="microg
         def lqr_step(carry, _):
             model_carry, current_s4_states, y_prev = carry
             
-            # Control law: u_t = -K * y_{t-1}
+            # 1. Compute control law: u_t = -K * y_{t-1}
+            # y_prev is (B_batch, 6), K_jax.T is (6, 3) -> u_t is (B_batch, 3)
             u_t = -jnp.matmul(y_prev, K_jax.T)
+            
+            # --- THE FIX: Concatenate state and control action ---
+            # The S4 model was trained with d_input=9, expecting [x_t, u_t]
+            s4_input = jnp.concatenate([y_prev, u_t], axis=-1)
+            # ----------------------------------------------------
             
             def single_sample_step(m, x, s):
                 pred, new_s = m(x, states=s, training=False)
                 return pred, new_s
 
-            vmap_runner = nnx.vmap(single_sample_step, in_axes=(nnx.StateAxes({nnx.Param: None}), 0, 0), out_axes=(0, 0))
-            y_next, next_s4_states = vmap_runner(model_carry, u_t, current_s4_states)
+            vmap_runner = nnx.vmap(
+                single_sample_step, 
+                in_axes=(nnx.StateAxes({nnx.Param: None}), 0, 0), 
+                out_axes=(0, 0)
+            )
+            
+            # 2. Pass the concatenated 9-dimensional vector into the S4 plant
+            y_next, next_s4_states = vmap_runner(model_carry, s4_input, current_s4_states)
             
             return (model_carry, next_s4_states, y_next), (u_t, y_next)
 
