@@ -59,7 +59,8 @@ sleep 10 # Wait for worker nodes to connect
 
 # 7. Execute your Python script
 echo "Executing Python Sweep..."
-python train_sweep.py
+# python train_sweep.py
+python train_lqr_sweep.py
 
 # 8. Cleanup
 ray stop
