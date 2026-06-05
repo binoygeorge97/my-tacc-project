@@ -165,6 +165,185 @@ def safe_train_regression(dataset, layer, seed, model_cfg, train_cfg, Ad, Bd, un
             save_model(model, {'dataset': dataset, 'layer': layer, 'model': model_cfg, 'train': train_cfg}, unique_save_path)
     return model, best_loss
 
+
+
+# =========================================================================
+# 3. OPEN-LOOP SYSTEM ID ROLLOUT & PLOTTING
+# =========================================================================
+def visualize_sysid_plots(inputs, targets, preds, dataset_name="microgrid", n_plot=3, custom_title=""):
+    inputs, targets, preds = np.array(inputs), np.array(targets), np.array(preds)
+    meta = DatasetMetadata.get(dataset_name, {})
+    dt = meta.get("dt", 0.01)
+    
+    in_labels = meta.get("input_labels", [f"Input Ch {d}" for d in range(inputs.shape[-1])])
+    out_labels = meta.get("output_labels", [f"Output Ch {d}" for d in range(targets.shape[-1])])
+    time_arr = np.arange(inputs.shape[1]) * dt
+
+    fig, axes = plt.subplots(n_plot, 2, figsize=(16, 4 * n_plot), squeeze=False)
+    fig.suptitle(custom_title, fontsize=14, fontweight='bold')
+
+    for i in range(n_plot):
+        ax_in, ax_out = axes[i, 0], axes[i, 1]
+        
+        # Plot Inputs [x_t, u_t]
+        for d in range(inputs.shape[-1]):
+            ax_in.plot(time_arr, inputs[i, :, d], alpha=0.7, label=in_labels[d] if d < len(in_labels) else f"In {d}")
+        ax_in.set_title(f"Sample {i}: Plant Inputs ($x_t, u_t$)")
+        ax_in.grid(True, alpha=0.3)
+        ax_in.legend(loc='upper right', fontsize='small', ncol=2)
+
+        # Plot Outputs (Predicted y_{t+1} vs True y_{t+1})
+        total_mse = 0.0
+        for d in range(targets.shape[-1]):
+            label_name = out_labels[d] if d < len(out_labels) else f"Out {d}"
+            ax_out.plot(time_arr, targets[i, :, d], '-', linewidth=2, alpha=0.5, label=f'True: {label_name}')
+            ax_out.plot(time_arr, preds[i, :, d], '--', linewidth=1.5, label=f'Pred: {label_name}')
+            total_mse += np.mean((targets[i, :, d] - preds[i, :, d])**2)
+            
+        ax_out.set_title(f"Sample {i}: S4 Plant Predictions (Avg MSE: {total_mse/targets.shape[-1]:.5f})")
+        ax_out.grid(True, alpha=0.3)
+        ax_out.legend(loc='upper right', fontsize='small', ncol=2)
+
+    plt.tight_layout()
+    
+    safe_title = custom_title.replace(" | ", "_").replace("=", "").replace(" ", "_").replace("$", "").replace("^", "")
+    save_dir = "plots"
+    os.makedirs(save_dir, exist_ok=True)
+    abs_save_path = os.path.abspath(os.path.join(save_dir, f"{safe_title}.png"))
+    plt.savefig(abs_save_path, bbox_inches='tight', dpi=300)
+    print(f"[*] Saved open-loop SysID plot locally to {abs_save_path}")
+    
+    # Return the memory-buffered figure for safe W&B uploading
+    return fig
+
+def run_sysid_evaluation(model, Ad, Bd, d_model, n_layers, dataset_name="microgrid", custom_title=""):
+    print(f"[*] Simulating Open-Loop S4 System ID Rollout...")
+
+    l_max, bsz = 200, 32
+    _, testloader, _, _ = create_microgrid_dataloaders(Ad, Bd, bsz=bsz, L=l_max)
+
+    inputs_u, targets_y = jnp.array(testloader[0][0]), jnp.array(testloader[0][1])
+    H_dim, N_dim = d_model, 64 
+
+    @nnx.jit
+    def step_by_step_inference(model, inputs):
+        B_batch, L, D = inputs.shape
+        inputs_t = jnp.transpose(inputs, (1, 0, 2))
+        init_states = [jnp.zeros((B_batch, H_dim, N_dim), dtype=jnp.complex64) for _ in range(n_layers)]
+
+        def scan_step(carry, x_t):
+            model_carry, current_states_batch = carry
+            def single_sample_step(m, x, s):
+                pred, new_s = m(x, states=s, training=False)
+                return pred, new_s
+
+            runner = nnx.vmap(
+                single_sample_step, 
+                in_axes=(nnx.StateAxes({nnx.Param: None}), 0, 0), 
+                out_axes=(0, 0)
+            )
+            pred_batch, new_states_batch = runner(model_carry, x_t, current_states_batch)
+            return (model_carry, new_states_batch), pred_batch
+
+        initial_carry = (model, init_states)
+        _, preds_t = nnx.scan(scan_step, in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))(initial_carry, inputs_t)
+        return jnp.transpose(preds_t, (1, 0, 2))
+
+    preds_y = step_by_step_inference(model, inputs_u)
+    
+    # Pass the figure up the chain
+    return visualize_sysid_plots(inputs_u, targets_y, preds_y, dataset_name=dataset_name, n_plot=3, custom_title=custom_title)
+
+
+# =========================================================================
+# RAY WORKER
+# =========================================================================
+@ray.remote(num_gpus=0.2)
+def train_single_model(matrix_dict, hp_dict):
+    matrix_id, A_continuous = matrix_dict["matrix_id"], matrix_dict["A_continuous"]
+    
+    # Unpack hyperparameters to create a truly unique signature for this run
+    N_val = hp_dict["N"]
+    d_val = hp_dict["d_model"]
+    L_val = hp_dict["n_layers"]
+    
+    # --- FIX 1: Unique W&B Run Name ---
+    run_signature = f"mat{matrix_id}_N{N_val}_d{d_val}_L{L_val}"
+    
+    run = wandb.init(
+        project="tacc-microgrid-s4-sweep", 
+        name=run_signature,   
+        config={**hp_dict, "matrix_id": matrix_id, "controller": "LQR"},
+        settings=wandb.Settings(start_method="thread") 
+    )
+
+    model_cfg = {k: hp_dict[k] for k in ["d_model", "n_layers", "N", "l_max", "dropout", "prenorm"]}
+    model_cfg["embedding"] = False
+    train_cfg = {"epochs": hp_dict["epochs"], "bsz": hp_dict["batch_size"], "lr": hp_dict["lr"], "weight_decay": 0.0}
+    
+    # --- FIX 2: Unique Checkpoint Path ---
+    unique_save_path = f"checkpoints/sweep/{run_signature}_best.msgpack"
+
+    Ad, Bd = get_discrete_matrices(A_continuous)
+    
+    # Train the S4 representation of the microgrid dynamics
+    trained_model, final_mse = safe_train_regression(
+        "microgrid", "s4", 42, model_cfg, train_cfg, Ad, Bd, unique_save_path
+    )
+
+    # Load the RNN state-space equivalent
+    rnn_model = load_model_regression(unique_save_path, d_input_arg=9, d_output_arg=6)
+
+    # ---------------------------------------------------------
+    # EVALUATION 1: Open-Loop System Identification
+    # ---------------------------------------------------------
+    # --- FIX 3: Unique Plot Titles (prevents .png overwrite crashes) ---
+    sysid_title = f"SysID | Mat {matrix_id} | N={N_val}, d={d_val}, L={L_val}"
+    fig_sysid = run_sysid_evaluation(
+        model=rnn_model, 
+        Ad=Ad, Bd=Bd, 
+        d_model=model_cfg['d_model'], 
+        n_layers=model_cfg['n_layers'], 
+        dataset_name="microgrid", 
+        custom_title=sysid_title
+    )
+
+    # ---------------------------------------------------------
+    # EVALUATION 2: Closed-Loop LQR Control
+    # ---------------------------------------------------------
+    print(f"[*] Calculating optimal LQR controller gains for {run_signature}...")
+    K_gain = compute_lqr_gain(Ad, Bd, Q_weight=1.0, R_weight=0.1)
+
+    lqr_title = f"LQR | Mat {matrix_id} | N={N_val}, d={d_val}, L={L_val}"
+    fig_lqr = run_lqr_evaluation(
+        model=rnn_model, 
+        Ad=Ad, Bd=Bd, 
+        K=K_gain,
+        d_model=model_cfg['d_model'], 
+        n_layers=model_cfg['n_layers'], 
+        dataset_name="microgrid", 
+        custom_title=lqr_title
+    )
+
+    # ---------------------------------------------------------
+    # W&B UPLOAD
+    # ---------------------------------------------------------
+    print(f"[*] Uploading memory-buffered plots to W&B run: {run.name}")
+    run.log({
+        "final_sys_id_mse": final_mse,
+        "Open_Loop_SysID_Plots": wandb.Image(fig_sysid),
+        "Closed_Loop_LQR_Plots": wandb.Image(fig_lqr)
+    })
+    
+    # Clean up Matplotlib memory
+    plt.close(fig_sysid)
+    plt.close(fig_lqr)
+    
+    time.sleep(3) # Ensure background thread finishes
+    run.finish()
+    
+    return {"matrix_id": matrix_id, "signature": run_signature, "mse": final_mse, "path": unique_save_path}
+
 # # =========================================================================
 # # 3. RAY WORKER
 # # =========================================================================
@@ -175,7 +354,9 @@ def safe_train_regression(dataset, layer, seed, model_cfg, train_cfg, Ad, Bd, un
 #     run = wandb.init(
 #         project="tacc-microgrid-s4-sweep", 
 #         name=f"matrix_{matrix_id}_lqr",   
-#         config={**hp_dict, "matrix_id": matrix_id, "controller": "LQR"}
+#         config={**hp_dict, "matrix_id": matrix_id, "controller": "LQR"},
+#         # --- CRITICAL FIX 1: Run W&B in a thread so Ray doesn't kill it prematurely ---
+#         settings=wandb.Settings(start_method="thread") 
 #     )
 
 #     model_cfg = {k: hp_dict[k] for k in ["d_model", "n_layers", "N", "l_max", "dropout", "prenorm"]}
@@ -188,8 +369,6 @@ def safe_train_regression(dataset, layer, seed, model_cfg, train_cfg, Ad, Bd, un
 #     trained_model, final_mse = safe_train_regression(
 #         "microgrid", "s4", 42, model_cfg, train_cfg, Ad, Bd, unique_save_path
 #     )
-    
-#     wandb.log({"final_sys_id_mse": final_mse})
 
 #     rnn_model = load_model_regression(unique_save_path, d_input_arg=9, d_output_arg=6)
 
@@ -197,7 +376,9 @@ def safe_train_regression(dataset, layer, seed, model_cfg, train_cfg, Ad, Bd, un
 #     K_gain = compute_lqr_gain(Ad, Bd, Q_weight=1.0, R_weight=0.1)
 
 #     plot_title = f"Closed-Loop LQR Control | Matrix {matrix_id} | d_model={model_cfg['d_model']}"
-#     run_lqr_evaluation(
+    
+#     # Catch the MATPLOTLIB FIGURE directly from the evaluation function
+#     fig = run_lqr_evaluation(
 #         model=rnn_model, 
 #         Ad=Ad, 
 #         Bd=Bd, 
@@ -208,176 +389,16 @@ def safe_train_regression(dataset, layer, seed, model_cfg, train_cfg, Ad, Bd, un
 #         custom_title=plot_title
 #     )
 
-#     # Force a final sync block to let the background thread push the image asset
-#     wandb.finish()
+#     print(f"[*] Uploading memory-buffered plot to W&B run: {run.name}")
+#     # --- CRITICAL FIX 2: Pass the in-memory figure to W&B, bypassing the filesystem ---
+#     run.log({
+#         "final_sys_id_mse": final_mse,
+#         "Closed_Loop_LQR_Plots": wandb.Image(fig)
+#     })
+    
+#     plt.close(fig) # Free up the memory now that W&B has buffered it
+#     run.finish()
 #     return {"matrix_id": matrix_id, "mse": final_mse, "path": unique_save_path}
-
-
-# # =========================================================================
-# # 4. CLOSED-LOOP ROLLOUT & PLOTTING
-# # =========================================================================
-# def visualize_lqr_plots(controlled_inputs, states, dataset_name="microgrid", n_plot=3, max_channels=4, custom_title=""):
-#     controlled_inputs, states = np.array(controlled_inputs), np.array(states)
-#     meta = DatasetMetadata.get(dataset_name, {})
-#     dt = meta.get("dt", 0.01)
-    
-#     in_labels = meta.get("input_labels", [f"Control Actuator {d}" for d in range(controlled_inputs.shape[-1])])
-#     out_labels = meta.get("output_labels", [f"State Ch {d}" for d in range(states.shape[-1])])
-#     time_arr = np.arange(states.shape[1]) * dt
-
-#     fig, axes = plt.subplots(n_plot, 2, figsize=(16, 4 * n_plot), squeeze=False)
-#     fig.suptitle(custom_title, fontsize=14, fontweight='bold')
-
-#     for i in range(n_plot):
-#         ax_in, ax_out = axes[i, 0], axes[i, 1]
-        
-#         # Plot Generated LQR Control Inputs (u_t)
-#         for d in range(min(controlled_inputs.shape[-1], max_channels)):
-#             ax_in.plot(time_arr, controlled_inputs[i, :, d], alpha=0.8, label=in_labels[d])
-#         ax_in.set_title(f"Sample {i}: LQR Control Action ($u_t$)")
-#         ax_in.grid(True, alpha=0.3)
-#         ax_in.legend(loc='upper right')
-
-#         # Plot Regulated Plant States (y_t decaying to zero)
-#         for d in range(min(states.shape[-1], max_channels)):
-#             ax_out.plot(time_arr, states[i, :, d], '-', linewidth=2, alpha=0.8, label=out_labels[d])
-            
-#         ax_out.set_title(f"Sample {i}: Regulated Plant States ($y_t$)")
-#         ax_out.grid(True, alpha=0.3)
-#         ax_out.legend(loc='upper right')
-
-#     plt.tight_layout()
-    
-#     # Clean the title string for file naming
-#     safe_title = custom_title.replace(" | ", "_").replace("=", "").replace(" ", "_").replace("$", "").replace("^", "")
-#     save_dir = "plots"
-#     os.makedirs(save_dir, exist_ok=True)
-#     relative_path = os.path.join(save_dir, f"{safe_title}.png")
-    
-#     # --- CRITICAL FIX 2: Compute Absolute Paths to map from Ray Virtual Environments ---
-#     abs_save_path = os.path.abspath(relative_path)
-#     plt.savefig(abs_save_path, bbox_inches='tight', dpi=300)
-    
-#     # --- CRITICAL FIX 3: Push using the absolute file path destination ---
-#     if wandb.run is not None:
-#         wandb.log({"Closed_Loop_LQR_Plots": wandb.Image(abs_save_path)})
-#         print(f"[*] Successfully logged plot to W&B run: {wandb.run.name}")
-        
-#     plt.close(fig)
-#     print(f"[*] Saved closed-loop control plot locally to {abs_save_path}")
-
-# def run_lqr_evaluation(model, Ad, Bd, K, d_model, n_layers, dataset_name="microgrid", custom_title=""):
-#     print(f"[*] Simulating Closed-Loop LQR + S4 System Rollout...")
-
-#     l_max, bsz = 100, 32
-#     _, testloader, _, _ = create_microgrid_dataloaders(Ad, Bd, bsz=bsz, L=l_max)
-
-#     targets_y = jnp.array(testloader[0][1]) 
-#     initial_states = targets_y[:, 0, :] 
-    
-#     H_dim, N_dim = d_model, 64 
-#     K_jax = jnp.array(K)
-
-#     @nnx.jit
-#     def closed_loop_scan(model, x0):
-#         B_batch = x0.shape[0]
-#         init_s4_states = [jnp.zeros((B_batch, H_dim, N_dim), dtype=jnp.complex64) for _ in range(n_layers)]
-
-#         def lqr_step(carry, _):
-#             model_carry, current_s4_states, y_prev = carry
-            
-#             # 1. Compute control law: u_t = -K * y_{t-1}
-#             # y_prev is (B_batch, 6), K_jax.T is (6, 3) -> u_t is (B_batch, 3)
-#             u_t = -jnp.matmul(y_prev, K_jax.T)
-            
-#             # --- THE FIX: Concatenate state and control action ---
-#             # The S4 model was trained with d_input=9, expecting [x_t, u_t]
-#             s4_input = jnp.concatenate([y_prev, u_t], axis=-1)
-#             # ----------------------------------------------------
-            
-#             def single_sample_step(m, x, s):
-#                 pred, new_s = m(x, states=s, training=False)
-#                 return pred, new_s
-
-#             vmap_runner = nnx.vmap(
-#                 single_sample_step, 
-#                 in_axes=(nnx.StateAxes({nnx.Param: None}), 0, 0), 
-#                 out_axes=(0, 0)
-#             )
-            
-#             # 2. Pass the concatenated 9-dimensional vector into the S4 plant
-#             y_next, next_s4_states = vmap_runner(model_carry, s4_input, current_s4_states)
-            
-#             return (model_carry, next_s4_states, y_next), (u_t, y_next)
-
-#         initial_carry = (model, init_s4_states, x0)
-#         _, (inputs_u_history, states_y_history) = nnx.scan(
-#             lqr_step, 
-#             in_axes=(nnx.Carry, 0), 
-#             out_axes=(nnx.Carry, 0)
-#         )(initial_carry, jnp.arange(l_max))
-        
-#         return jnp.transpose(inputs_u_history, (1, 0, 2)), jnp.transpose(states_y_history, (1, 0, 2))
-
-#     u_rollout, y_rollout = closed_loop_scan(model, initial_states)
-#     visualize_lqr_plots(u_rollout, y_rollout, dataset_name=dataset_name, n_plot=3, custom_title=custom_title)
-
-
-# =========================================================================
-# 3. RAY WORKER
-# =========================================================================
-@ray.remote(num_gpus=0.2)
-def train_single_model(matrix_dict, hp_dict):
-    matrix_id, A_continuous = matrix_dict["matrix_id"], matrix_dict["A_continuous"]
-    
-    run = wandb.init(
-        project="tacc-microgrid-s4-sweep", 
-        name=f"matrix_{matrix_id}_lqr",   
-        config={**hp_dict, "matrix_id": matrix_id, "controller": "LQR"},
-        # --- CRITICAL FIX 1: Run W&B in a thread so Ray doesn't kill it prematurely ---
-        settings=wandb.Settings(start_method="thread") 
-    )
-
-    model_cfg = {k: hp_dict[k] for k in ["d_model", "n_layers", "N", "l_max", "dropout", "prenorm"]}
-    model_cfg["embedding"] = False
-    train_cfg = {"epochs": hp_dict["epochs"], "bsz": hp_dict["batch_size"], "lr": hp_dict["lr"], "weight_decay": 0.0}
-    unique_save_path = f"checkpoints/sweep/mat{matrix_id}_best_model.msgpack"
-
-    Ad, Bd = get_discrete_matrices(A_continuous)
-    
-    trained_model, final_mse = safe_train_regression(
-        "microgrid", "s4", 42, model_cfg, train_cfg, Ad, Bd, unique_save_path
-    )
-
-    rnn_model = load_model_regression(unique_save_path, d_input_arg=9, d_output_arg=6)
-
-    print(f"[*] Calculating optimal LQR controller gains for Matrix {matrix_id}...")
-    K_gain = compute_lqr_gain(Ad, Bd, Q_weight=1.0, R_weight=0.1)
-
-    plot_title = f"Closed-Loop LQR Control | Matrix {matrix_id} | d_model={model_cfg['d_model']}"
-    
-    # Catch the MATPLOTLIB FIGURE directly from the evaluation function
-    fig = run_lqr_evaluation(
-        model=rnn_model, 
-        Ad=Ad, 
-        Bd=Bd, 
-        K=K_gain,
-        d_model=model_cfg['d_model'], 
-        n_layers=model_cfg['n_layers'], 
-        dataset_name="microgrid", 
-        custom_title=plot_title
-    )
-
-    print(f"[*] Uploading memory-buffered plot to W&B run: {run.name}")
-    # --- CRITICAL FIX 2: Pass the in-memory figure to W&B, bypassing the filesystem ---
-    run.log({
-        "final_sys_id_mse": final_mse,
-        "Closed_Loop_LQR_Plots": wandb.Image(fig)
-    })
-    
-    plt.close(fig) # Free up the memory now that W&B has buffered it
-    run.finish()
-    return {"matrix_id": matrix_id, "mse": final_mse, "path": unique_save_path}
 
 
 # =========================================================================
