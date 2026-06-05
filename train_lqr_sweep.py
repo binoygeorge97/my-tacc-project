@@ -294,13 +294,13 @@ def train_single_model(matrix_dict, hp_dict):
     # ---------------------------------------------------------
     # EVALUATION 1: Open-Loop System Identification
     # ---------------------------------------------------------
-    # --- FIX 3: Unique Plot Titles (prevents .png overwrite crashes) ---
     sysid_title = f"SysID | Mat {matrix_id} | N={N_val}, d={d_val}, L={L_val}"
     fig_sysid = run_sysid_evaluation(
         model=rnn_model, 
         Ad=Ad, Bd=Bd, 
         d_model=model_cfg['d_model'], 
         n_layers=model_cfg['n_layers'], 
+        N=N_val,  # <--- PASS N HERE
         dataset_name="microgrid", 
         custom_title=sysid_title
     )
@@ -318,10 +318,11 @@ def train_single_model(matrix_dict, hp_dict):
         K=K_gain,
         d_model=model_cfg['d_model'], 
         n_layers=model_cfg['n_layers'], 
+        N=N_val,  # <--- PASS N HERE
         dataset_name="microgrid", 
         custom_title=lqr_title
     )
-
+    
     # ---------------------------------------------------------
     # W&B UPLOAD
     # ---------------------------------------------------------
@@ -341,61 +342,6 @@ def train_single_model(matrix_dict, hp_dict):
     
     return {"matrix_id": matrix_id, "signature": run_signature, "mse": final_mse, "path": unique_save_path}
 
-# # =========================================================================
-# # 3. RAY WORKER
-# # =========================================================================
-# @ray.remote(num_gpus=0.2)
-# def train_single_model(matrix_dict, hp_dict):
-#     matrix_id, A_continuous = matrix_dict["matrix_id"], matrix_dict["A_continuous"]
-    
-#     run = wandb.init(
-#         project="tacc-microgrid-s4-sweep", 
-#         name=f"matrix_{matrix_id}_lqr",   
-#         config={**hp_dict, "matrix_id": matrix_id, "controller": "LQR"},
-#         # --- CRITICAL FIX 1: Run W&B in a thread so Ray doesn't kill it prematurely ---
-#         settings=wandb.Settings(start_method="thread") 
-#     )
-
-#     model_cfg = {k: hp_dict[k] for k in ["d_model", "n_layers", "N", "l_max", "dropout", "prenorm"]}
-#     model_cfg["embedding"] = False
-#     train_cfg = {"epochs": hp_dict["epochs"], "bsz": hp_dict["batch_size"], "lr": hp_dict["lr"], "weight_decay": 0.0}
-#     unique_save_path = f"checkpoints/sweep/mat{matrix_id}_best_model.msgpack"
-
-#     Ad, Bd = get_discrete_matrices(A_continuous)
-    
-#     trained_model, final_mse = safe_train_regression(
-#         "microgrid", "s4", 42, model_cfg, train_cfg, Ad, Bd, unique_save_path
-#     )
-
-#     rnn_model = load_model_regression(unique_save_path, d_input_arg=9, d_output_arg=6)
-
-#     print(f"[*] Calculating optimal LQR controller gains for Matrix {matrix_id}...")
-#     K_gain = compute_lqr_gain(Ad, Bd, Q_weight=1.0, R_weight=0.1)
-
-#     plot_title = f"Closed-Loop LQR Control | Matrix {matrix_id} | d_model={model_cfg['d_model']}"
-    
-#     # Catch the MATPLOTLIB FIGURE directly from the evaluation function
-#     fig = run_lqr_evaluation(
-#         model=rnn_model, 
-#         Ad=Ad, 
-#         Bd=Bd, 
-#         K=K_gain,
-#         d_model=model_cfg['d_model'], 
-#         n_layers=model_cfg['n_layers'], 
-#         dataset_name="microgrid", 
-#         custom_title=plot_title
-#     )
-
-#     print(f"[*] Uploading memory-buffered plot to W&B run: {run.name}")
-#     # --- CRITICAL FIX 2: Pass the in-memory figure to W&B, bypassing the filesystem ---
-#     run.log({
-#         "final_sys_id_mse": final_mse,
-#         "Closed_Loop_LQR_Plots": wandb.Image(fig)
-#     })
-    
-#     plt.close(fig) # Free up the memory now that W&B has buffered it
-#     run.finish()
-#     return {"matrix_id": matrix_id, "mse": final_mse, "path": unique_save_path}
 
 
 # =========================================================================
