@@ -216,14 +216,17 @@ def visualize_sysid_plots(inputs, targets, preds, dataset_name="microgrid", n_pl
     # Return the memory-buffered figure for safe W&B uploading
     return fig
 
-def run_sysid_evaluation(model, Ad, Bd, d_model, n_layers, dataset_name="microgrid", custom_title=""):
+# --- FIX 1: Add 'N' to the function signature ---
+def run_sysid_evaluation(model, Ad, Bd, d_model, n_layers, N, dataset_name="microgrid", custom_title=""):
     print(f"[*] Simulating Open-Loop S4 System ID Rollout...")
 
     l_max, bsz = 200, 32
     _, testloader, _, _ = create_microgrid_dataloaders(Ad, Bd, bsz=bsz, L=l_max)
 
     inputs_u, targets_y = jnp.array(testloader[0][0]), jnp.array(testloader[0][1])
-    H_dim, N_dim = d_model, 64 
+    
+    # --- FIX 2: Use the dynamic N value passed from the sweep ---
+    H_dim, N_dim = d_model, N 
 
     @nnx.jit
     def step_by_step_inference(model, inputs):
@@ -237,11 +240,7 @@ def run_sysid_evaluation(model, Ad, Bd, d_model, n_layers, dataset_name="microgr
                 pred, new_s = m(x, states=s, training=False)
                 return pred, new_s
 
-            runner = nnx.vmap(
-                single_sample_step, 
-                in_axes=(nnx.StateAxes({nnx.Param: None}), 0, 0), 
-                out_axes=(0, 0)
-            )
+            runner = nnx.vmap(single_sample_step, in_axes=(nnx.StateAxes({nnx.Param: None}), 0, 0), out_axes=(0, 0))
             pred_batch, new_states_batch = runner(model_carry, x_t, current_states_batch)
             return (model_carry, new_states_batch), pred_batch
 
@@ -250,8 +249,6 @@ def run_sysid_evaluation(model, Ad, Bd, d_model, n_layers, dataset_name="microgr
         return jnp.transpose(preds_t, (1, 0, 2))
 
     preds_y = step_by_step_inference(model, inputs_u)
-    
-    # Pass the figure up the chain
     return visualize_sysid_plots(inputs_u, targets_y, preds_y, dataset_name=dataset_name, n_plot=3, custom_title=custom_title)
 
 
@@ -448,7 +445,8 @@ def visualize_lqr_plots(controlled_inputs, states, dataset_name="microgrid", n_p
     # --- CRITICAL FIX 3: Return the actual FIGURE OBJECT instead of the file path ---
     return fig
 
-def run_lqr_evaluation(model, Ad, Bd, K, d_model, n_layers, dataset_name="microgrid", custom_title=""):
+# --- FIX 3: Add 'N' to the function signature ---
+def run_lqr_evaluation(model, Ad, Bd, K, d_model, n_layers, N, dataset_name="microgrid", custom_title=""):
     print(f"[*] Simulating Closed-Loop LQR + S4 System Rollout...")
 
     l_max, bsz = 200, 32
@@ -457,7 +455,8 @@ def run_lqr_evaluation(model, Ad, Bd, K, d_model, n_layers, dataset_name="microg
     targets_y = jnp.array(testloader[0][1]) 
     initial_states = targets_y[:, 0, :] 
     
-    H_dim, N_dim = d_model, 64 
+    # --- FIX 4: Use the dynamic N value ---
+    H_dim, N_dim = d_model, N 
     K_jax = jnp.array(K)
 
     @nnx.jit
@@ -467,7 +466,6 @@ def run_lqr_evaluation(model, Ad, Bd, K, d_model, n_layers, dataset_name="microg
 
         def lqr_step(carry, _):
             model_carry, current_s4_states, y_prev = carry
-            
             u_t = -jnp.matmul(y_prev, K_jax.T)
             s4_input = jnp.concatenate([y_prev, u_t], axis=-1)
             
@@ -475,28 +473,16 @@ def run_lqr_evaluation(model, Ad, Bd, K, d_model, n_layers, dataset_name="microg
                 pred, new_s = m(x, states=s, training=False)
                 return pred, new_s
 
-            vmap_runner = nnx.vmap(
-                single_sample_step, 
-                in_axes=(nnx.StateAxes({nnx.Param: None}), 0, 0), 
-                out_axes=(0, 0)
-            )
-            
+            vmap_runner = nnx.vmap(single_sample_step, in_axes=(nnx.StateAxes({nnx.Param: None}), 0, 0), out_axes=(0, 0))
             y_next, next_s4_states = vmap_runner(model_carry, s4_input, current_s4_states)
             
             return (model_carry, next_s4_states, y_next), (u_t, y_next)
 
         initial_carry = (model, init_s4_states, x0)
-        _, (inputs_u_history, states_y_history) = nnx.scan(
-            lqr_step, 
-            in_axes=(nnx.Carry, 0), 
-            out_axes=(nnx.Carry, 0)
-        )(initial_carry, jnp.arange(l_max))
-        
+        _, (inputs_u_history, states_y_history) = nnx.scan(lqr_step, in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))(initial_carry, jnp.arange(l_max))
         return jnp.transpose(inputs_u_history, (1, 0, 2)), jnp.transpose(states_y_history, (1, 0, 2))
 
     u_rollout, y_rollout = closed_loop_scan(model, initial_states)
-    
-    # Pass the figure object up the chain
     return visualize_lqr_plots(u_rollout, y_rollout, dataset_name=dataset_name, n_plot=3, custom_title=custom_title)
 
 
