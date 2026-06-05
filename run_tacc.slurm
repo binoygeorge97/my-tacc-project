@@ -2,10 +2,10 @@
 #SBATCH -J nnx_sweep
 #SBATCH -o nnx_sweep_%j.out
 #SBATCH -e nnx_sweep_%j.err
-#SBATCH -p gpu-a100                 # Change to gpu-h100 if you want the H100 nodes
-#SBATCH -N 3                        # Requesting 3 nodes
-#SBATCH -n 3                        # 3 tasks (1 per node)
-#SBATCH -t 02:00:00                 # Max runtime (2 hours)
+#SBATCH -p gpu-a100-dev                 # Change to gpu-h100 if you want the H100 nodes
+#SBATCH -N 1                        # Requesting 3 nodes
+#SBATCH -n 1                        # 3 tasks (1 per node)
+#SBATCH -t 00:40:00                 # Max runtime (2 hours)
 #SBATCH -A IRI26016 
 #SBATCH --mail-user=phdstudiescontrols@gmail.com
 #SBATCH --mail-type=BEGIN,END,FAIL
