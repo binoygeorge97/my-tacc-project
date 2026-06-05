@@ -29,7 +29,7 @@ from data.dataloader import (
     create_microgrid_dataloaders,
     DatasetMetadata
 )
-from data.systems import get_sweep_configs
+from data.systems2 import get_sweep_configs
 
 # =========================================================================
 # 1. LQR CONTROL SOLVER
