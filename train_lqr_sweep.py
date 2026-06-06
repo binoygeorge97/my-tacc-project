@@ -252,6 +252,67 @@ def run_sysid_evaluation(model, Ad, Bd, d_model, n_layers, N, dataset_name="micr
     return visualize_sysid_plots(inputs_u, targets_y, preds_y, dataset_name=dataset_name, n_plot=3, custom_title=custom_title)
 
 
+# ---------------------------------------------------------
+# NEW: AUTOREGRESSIVE SYSID EVALUATION
+# ---------------------------------------------------------
+def run_ar_sysid_evaluation(model, Ad, Bd, d_model, n_layers, N, dataset_name="microgrid", custom_title=""):
+    print(f"[*] Simulating Autoregressive S4 System ID Rollout...")
+
+    l_max, bsz = 200, 32
+    _, testloader, _, _ = create_microgrid_dataloaders(Ad, Bd, bsz=bsz, L=l_max)
+
+    # inputs_full contains the teacher-forced data [x_t, u_t]
+    inputs_full = jnp.array(testloader[0][0])
+    targets_y = jnp.array(testloader[0][1])
+
+    # Isolate the initial state and the true sequence of control actions
+    # Assumes your data is shaped [Batch, Time, 9] -> (6 states, 3 controls)
+    x0 = inputs_full[:, 0, :6]      
+    u_seq = inputs_full[:, :, 6:]   
+
+    H_dim, N_dim = d_model, N 
+
+    @nnx.jit
+    def autoregressive_scan(model, x0_batch, u_batch_seq):
+        B_batch, L, _ = u_batch_seq.shape
+        init_s4_states = [jnp.zeros((B_batch, H_dim, N_dim), dtype=jnp.complex64) for _ in range(n_layers)]
+        u_t_seq = jnp.transpose(u_batch_seq, (1, 0, 2))
+
+        def ar_step(carry, u_t):
+            model_carry, current_s4_states, y_prev = carry
+            
+            # THE CORE DIFFERENCE: We concatenate the model's PREVIOUS PREDICTION 
+            # with the TRUE CONTROL ACTION, completely blinding it to the true state.
+            s4_input = jnp.concatenate([y_prev, u_t], axis=-1)
+
+            def single_sample_step(m, x, s):
+                pred, new_s = m(x, states=s, training=False)
+                return pred, new_s
+
+            vmap_runner = nnx.vmap(single_sample_step, in_axes=(nnx.StateAxes({nnx.Param: None}), 0, 0), out_axes=(0, 0))
+            y_next, next_s4_states = vmap_runner(model_carry, s4_input, current_s4_states)
+
+            return (model_carry, next_s4_states, y_next), y_next
+
+        initial_carry = (model, init_s4_states, x0_batch)
+        _, states_y_history = nnx.scan(ar_step, in_axes=(nnx.Carry, 0), out_axes=(nnx.Carry, 0))(initial_carry, u_t_seq)
+        return jnp.transpose(states_y_history, (1, 0, 2))
+
+    # Run the autoregressive loop
+    ar_preds_y = autoregressive_scan(model, x0, u_seq)
+    
+    # Calculate the quantitative ranking metric
+    ar_mse = float(np.mean((targets_y - ar_preds_y) ** 2))
+
+    # Reuse the existing plotting function to generate the visual
+    fig = visualize_sysid_plots(
+        inputs_full, targets_y, ar_preds_y, 
+        dataset_name=dataset_name, n_plot=3, custom_title=custom_title
+    )
+
+    return fig, ar_mse
+
+
 # =========================================================================
 # RAY WORKER
 # =========================================================================
@@ -292,17 +353,17 @@ def train_single_model(matrix_dict, hp_dict):
     rnn_model = load_model_regression(unique_save_path, d_input_arg=9, d_output_arg=6)
 
     # ---------------------------------------------------------
-    # EVALUATION 1: Open-Loop System Identification
+    # EVALUATION 1: Autoregressive System Identification
     # ---------------------------------------------------------
-    sysid_title = f"SysID | Mat {matrix_id} | N={N_val}, d={d_val}, L={L_val}"
-    fig_sysid = run_sysid_evaluation(
+    ar_sysid_title = f"Autoregressive SysID | Mat {matrix_id} | N={N_val}, d={d_val}, L={L_val}"
+    fig_ar_sysid, ar_mse = run_ar_sysid_evaluation(
         model=rnn_model, 
         Ad=Ad, Bd=Bd, 
         d_model=model_cfg['d_model'], 
         n_layers=model_cfg['n_layers'], 
-        N=N_val,  # <--- PASS N HERE
+        N=N_val,  
         dataset_name="microgrid", 
-        custom_title=sysid_title
+        custom_title=ar_sysid_title
     )
 
     # ---------------------------------------------------------
@@ -318,29 +379,30 @@ def train_single_model(matrix_dict, hp_dict):
         K=K_gain,
         d_model=model_cfg['d_model'], 
         n_layers=model_cfg['n_layers'], 
-        N=N_val,  # <--- PASS N HERE
+        N=N_val,  
         dataset_name="microgrid", 
         custom_title=lqr_title
     )
     
     # ---------------------------------------------------------
-    # W&B UPLOAD
+    # W&B UPLOAD & QUANTITATIVE RANKING
     # ---------------------------------------------------------
-    print(f"[*] Uploading memory-buffered plots to W&B run: {run.name}")
+    print(f"[*] Uploading memory-buffered plots and metrics to W&B run: {run.name}")
     run.log({
-        "final_sys_id_mse": final_mse,
-        "Open_Loop_SysID_Plots": wandb.Image(fig_sysid),
+        "teacher_forced_test_mse": final_mse,
+        "autoregressive_test_mse": ar_mse,  # <-- YOUR RANKING METRIC
+        "Autoregressive_SysID_Plots": wandb.Image(fig_ar_sysid),
         "Closed_Loop_LQR_Plots": wandb.Image(fig_lqr)
     })
     
     # Clean up Matplotlib memory
-    plt.close(fig_sysid)
+    plt.close(fig_ar_sysid)
     plt.close(fig_lqr)
     
     time.sleep(3) # Ensure background thread finishes
     run.finish()
     
-    return {"matrix_id": matrix_id, "signature": run_signature, "mse": final_mse, "path": unique_save_path}
+    return {"matrix_id": matrix_id, "signature": run_signature, "teacher_mse": final_mse, "ar_mse": ar_mse, "path": unique_save_path}
 
 
 
