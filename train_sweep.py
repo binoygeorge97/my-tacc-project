@@ -172,6 +172,8 @@ def train_single_model(matrix_dict, hp_dict):
     rnn_model = load_model_regression(unique_save_path, d_input_arg=9, d_output_arg=6)
     # ---------------------------------------------------------------------
 
+    N_val = hp_dict["N"]
+
     # --- Run Evaluation INSIDE the worker before W&B closes ---
     plot_title = f"Matrix {matrix_id} | d_model={model_cfg['d_model']} | Test MSE: {final_mse:.6f}"
     run_evaluation(
@@ -179,6 +181,7 @@ def train_single_model(matrix_dict, hp_dict):
         Ad=Ad, 
         Bd=Bd, 
         d_model=model_cfg['d_model'], 
+        N=N_val,
         n_layers=model_cfg['n_layers'], 
         dataset_name="microgrid", 
         custom_title=plot_title
@@ -244,14 +247,14 @@ def visualize_system_plots(inputs, targets, preds, dataset_name="microgrid", n_p
     print(f"[*] Saved evaluation plot to {save_path} and logged to W&B")
 
 
-def run_evaluation(model, Ad, Bd, d_model, n_layers, dataset_name="microgrid", custom_title=""):
+def run_evaluation(model, Ad, Bd, d_model, n_layers, N, dataset_name="microgrid", custom_title=""):
     print(f"[*] Running Step-by-Step RNN Inference for: {custom_title}")
 
     l_max, bsz = 100, 32
     _, testloader, _, _ = create_microgrid_dataloaders(Ad, Bd, bsz=bsz, L=l_max)
 
     inputs_u, targets_y = jnp.array(testloader[0][0]), jnp.array(testloader[0][1])
-    H_dim, N_dim = d_model, 64 
+    H_dim, N_dim = d_model, N 
 
     @nnx.jit
     def step_by_step_inference(model, inputs):
