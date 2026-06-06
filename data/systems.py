@@ -2,7 +2,7 @@
 import numpy as np
 
 def get_sweep_configs():
-    hp = {"d_model": 128, "n_layers": 2, "dropout": 0.0, "prenorm": True, "lr": 1e-3, "batch_size": 32, "epochs": 70, "N": 64, "l_max": 100}
+    hp = {"d_model": 64, "n_layers": 1, "dropout": 0.0, "prenorm": True, "lr": 1e-3, "batch_size": 32, "epochs": 70, "N": 32, "l_max": 100}
     hp_marginal = hp.copy()
     hp_marginal["d_model"] = 64
     Z = np.zeros((2, 2))
